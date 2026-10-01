@@ -1,239 +1,139 @@
-from datetime import datetime
+import io
 import pandas as pd
-from supabase import create_client
 import streamlit as st
 
-# Configuration de la page Streamlit
-st.set_page_config(
-    page_title="Suivi des Livraisons - Carrière", page_icon="🏗️", layout="wide"
-)
+st.set_page_config(page_title="Suivi livraisons carrières", page_icon="🚚", layout="wide")
+st.title("🚚 Suivi des livraisons – Matériaux de carrière")
 
-# Connexion à Supabase
-supabase_url = st.secrets["supabase"]["url"]
-supabase_key = st.secrets["supabase"]["key"]
-supabase = create_client(supabase_url, supabase_key)
+# ---------- Chargement du fichier ----------
+fichier = st.file_uploader("Importer le fichier Excel de suivi", type=["xlsx", "xls", "xlsm"])
+if fichier is None:
+    st.info("Importez un fichier Excel pour commencer.")
+    st.stop()
 
-st.title("🏗️ Tableau de Bord - Suivi des Livraisons")
-
-# Menu latéral pour basculer entre le Dashboard et l'Importation
-menu = st.sidebar.selectbox(
-    "Navigation", ["📊 Tableau de Bord", "📥 Importer un nouveau fichier"]
-)
-
-
-# --- 1. FONCTION DE CHARGEMENT DES DONNÉES DEPUIS SUPABASE ---
-@st.cache_data(ttl=10)  # TTL réduit à 10 secondes pour actualiser plus vite
-def charger_donnees():
-  response = (
-      supabase.table("livraisons_carrieres")
-      .select("*")
-      .eq("carriere", "BS")
-      .execute()
-  )
-  data = response.data
-  if data:
-    return pd.DataFrame(data)
-  else:
-    return pd.DataFrame()
+xl = pd.ExcelFile(fichier)
+feuille = st.sidebar.selectbox("Feuille Excel", xl.sheet_names)
+ligne_entete = st.sidebar.number_input("Ligne d'en-tête (0 = 1ère ligne)", 0, 50, 0)
+df = xl.parse(feuille, header=int(ligne_entete))
+df.columns = [str(c).strip() for c in df.columns]
+df = df.dropna(how="all")
 
 
-df_global = charger_donnees()
+# ---------- Détection / choix des colonnes ----------
+def devine(mots, cols):
+    for c in cols:
+        if any(m in c.lower() for m in mots):
+            return c
+    return None
 
-# Bouton de rafraîchissement manuel
-if st.sidebar.button("🔄 Rafraîchir les données"):
-  st.cache_data.clear()
-  st.rerun()
 
-# ==========================================
-# PARTIE 1 : TABLEAU DE BORD (DASHBOARD)
-# ==========================================
-if menu == "📊 Tableau de Bord":
-  if df_global.empty:
-    st.warning(
-        "Aucune donnée trouvée dans Supabase. Veuillez importer un fichier via"
-        " le menu latéral."
-    )
-  else:
-    # --- SECTION DE CONTRÔLE : CE QUI EST DANS LA BASE ---
-    st.subheader("🔍 État des données enregistrées dans Supabase (par mois)")
-    # On groupe par mois pour voir exactement combien de lignes chaque mois contient en base
-    df_resume = (
-        df_global.groupby("mois_annee")
-        .agg(
-            Lignes_Injectees=("id", "count"),
-            Tonnage_Total=("qte_tonnes", "sum"),
-        )
-        .reset_index()
-    )
-    st.dataframe(df_resume, use_container_width=True)
-    st.markdown("---")
+cols = list(df.columns)
+st.sidebar.subheader("Correspondance des colonnes")
 
-    st.sidebar.header("🔍 Filtres d'analyse")
 
-    # Filtre par Mois / Année
-    mois_disponibles = sorted(df_global["mois_annee"].dropna().unique())
-    mois_selectionnes = st.sidebar.multiselect(
-        "Filtrer par Mois / Période",
-        mois_disponibles,
-        default=mois_disponibles,
-    )
+def choix(label, mots, optionnel=False):
+    options = ([None] if optionnel else []) + cols
+    d = devine(mots, cols)
+    idx = options.index(d) if d in options else 0
+    return st.sidebar.selectbox(label, options, index=idx,
+                                format_func=lambda x: "— aucune —" if x is None else x)
 
-    # Filtre par Client
-    clients_disponibles = sorted(df_global["client"].dropna().unique())
-    client_selectionne = st.sidebar.multiselect(
-        "Filtrer par Client", clients_disponibles
-    )
 
-    # Application des filtres
-    df_Filtre = df_global[df_global["mois_annee"].isin(mois_selectionnes)]
-    if client_selectionne:
-      df_Filtre = df_Filtre[df_Filtre["client"].isin(client_selectionne)]
+c_date = choix("Date", ["date"])
+c_client = choix("Client", ["client"])
+c_produit = choix("Produit", ["produit", "article", "matériau", "materiau", "désignation", "designation"])
+c_qte = choix("Quantité", ["quant", "qté", "qte", "tonnage", "poids"], optionnel=True)
+c_pu = choix("Prix unitaire", ["prix", "p.u", "pu "], optionnel=True)
+c_net = choix("Montant HT Net", ["ht net", "net ht", "montant ht", "total ht"], optionnel=True)
 
-    # --- KPIs PRINCIPAUX ---
-    st.subheader("📈 Indicateurs Clés de Performance (KPIs)")
-    total_tonnes = df_Filtre["qte_tonnes"].sum()
-    total_m3 = df_Filtre["qte_m3"].sum()
-    total_montant = df_Filtre["montant_ht"].sum()
+# ---------- Préparation des données ----------
+data = df.copy()
+data[c_date] = pd.to_datetime(data[c_date], errors="coerce", dayfirst=True)
+data = data.dropna(subset=[c_date])
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("📦 Tonnage Total (T)", f"{total_tonnes:,.2f} T")
-    col2.metric("📐 Volume Total (M3)", f"{total_m3:,.2f} m³")
-    col3.metric("💰 Chiffre d'Affaires HT", f"{total_montant:,.2f} Dh")
+if c_net:
+    data["Montant HT Net"] = pd.to_numeric(data[c_net], errors="coerce").fillna(0)
+elif c_qte and c_pu:
+    data["Montant HT Net"] = (pd.to_numeric(data[c_qte], errors="coerce").fillna(0)
+                              * pd.to_numeric(data[c_pu], errors="coerce").fillna(0))
+    st.sidebar.caption("Montant HT Net calculé = Quantité × Prix unitaire")
+else:
+    st.error("Choisissez la colonne « Montant HT Net » ou bien Quantité + Prix unitaire.")
+    st.stop()
 
-    st.markdown("---")
+data["Mois"] = data[c_date].dt.to_period("M").astype(str)
+data[c_client] = data[c_client].astype(str).str.strip()
+data[c_produit] = data[c_produit].astype(str).str.strip()
+if c_qte:
+    data["Quantité"] = pd.to_numeric(data[c_qte], errors="coerce").fillna(0)
 
-    # --- GRAPHIQUES ET ANALYSES ---
-    st.subheader("📊 Évolution des Livraisons en Tonnes")
-    if not df_Filtre.empty:
-      df_chart = (
-          df_Filtre.groupby("mois_annee")["qte_tonnes"].sum().reset_index()
-      )
-      st.bar_chart(df_chart.set_index("mois_annee"))
+# ---------- Filtres ----------
+st.sidebar.subheader("Filtres")
+mois = st.sidebar.multiselect("Mois", sorted(data["Mois"].unique()))
+clients = st.sidebar.multiselect("Client", sorted(data[c_client].unique()))
+produits = st.sidebar.multiselect("Produit", sorted(data[c_produit].unique()))
 
-    st.markdown("---")
+mn, mx = float(data["Montant HT Net"].min()), float(data["Montant HT Net"].max())
+if mn < mx:
+    plage = st.sidebar.slider("Montant HT Net (par ligne)", mn, mx, (mn, mx))
+else:
+    plage = (mn, mx)
 
-    # --- TABLEAU DÉTAILLÉ ---
-    st.subheader("📋 Détail des Livraisons")
-    st.write(f"Affichage de {len(df_Filtre)} lignes filtrées :")
-    st.dataframe(
-        df_Filtre[
-            [
-                "mois_annee",
-                "date_livraison",
-                "client",
-                "produit",
-                "qte_tonnes",
-                "qte_m3",
-                "montant_ht",
-                "chantier",
-            ]
-        ],
-        use_container_width=True,
-    )
+f = data.copy()
+if mois:
+    f = f[f["Mois"].isin(mois)]
+if clients:
+    f = f[f[c_client].isin(clients)]
+if produits:
+    f = f[f[c_produit].isin(produits)]
+f = f[f["Montant HT Net"].between(plage[0], plage[1])]
 
-# ==========================================
-# PARTIE 2 : IMPORTATION DES FICHIERS
-# ==========================================
-elif menu == "📥 Importer un nouveau fichier":
-  st.header("📥 Importer un classeur de livraisons")
-  st.write(
-      "Glissez-déposez le fichier Excel complet (avec ses 33 feuilles) pour"
-      " actualiser la base de données."
-  )
+# ---------- Indicateurs ----------
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Montant HT Net total", f"{f['Montant HT Net'].sum():,.2f}".replace(",", " "))
+k2.metric("Nb de livraisons", f"{len(f):,}".replace(",", " "))
+k3.metric("Nb de clients", f[c_client].nunique())
+if c_qte:
+    k4.metric("Quantité totale", f"{f['Quantité'].sum():,.2f}".replace(",", " "))
 
-  uploaded_file = st.file_uploader(
-      "Fichier Excel (.xlsx)", type=["xlsx", "xls"]
-  )
+# ---------- Onglets ----------
+t1, t2, t3, t4 = st.tabs(["📅 Par mois", "👥 Par client", "🪨 Par produit", "📋 Détail"])
 
-  if uploaded_file is not None:
-    try:
-      toutes_les_feuilles = pd.read_excel(uploaded_file, sheet_name=None)
-      st.success(
-          f"Fichier chargé avec succès ! {len(toutes_les_feuilles)} feuilles"
-          " détectées."
-      )
+with t1:
+    m = f.groupby("Mois", as_index=False)["Montant HT Net"].sum()
+    st.bar_chart(m, x="Mois", y="Montant HT Net")
+    st.dataframe(m, use_container_width=True)
 
-      if st.button("Valider et envoyer tout vers Supabase"):
-        total_insered = 0
-        bar = st.progress(0)
-        total_feuilles = len(toutes_les_feuilles)
+with t2:
+    c = (f.groupby(c_client, as_index=False)["Montant HT Net"].sum()
+         .sort_values("Montant HT Net", ascending=False))
+    st.bar_chart(c, x=c_client, y="Montant HT Net")
+    st.dataframe(c, use_container_width=True)
+    st.markdown("**Client × Mois**")
+    st.dataframe(f.pivot_table(index=c_client, columns="Mois", values="Montant HT Net",
+                               aggfunc="sum", fill_value=0, margins=True, margins_name="Total"),
+                 use_container_width=True)
 
-        i = 0
-        for nom_feuille, df in toutes_les_feuilles.items():
-          df_propre = pd.read_excel(
-              uploaded_file, sheet_name=nom_feuille, header=3
-          )
+with t3:
+    p = (f.groupby(c_produit, as_index=False)["Montant HT Net"].sum()
+         .sort_values("Montant HT Net", ascending=False))
+    st.bar_chart(p, x=c_produit, y="Montant HT Net")
+    st.dataframe(p, use_container_width=True)
+    st.markdown("**Produit × Client**")
+    st.dataframe(f.pivot_table(index=c_produit, columns=c_client, values="Montant HT Net",
+                               aggfunc="sum", fill_value=0, margins=True, margins_name="Total"),
+                 use_container_width=True)
 
-          records_a_inserer = []
-          for index, row in df_propre.iterrows():
-            valeurs = row.values
+with t4:
+    st.dataframe(f.drop(columns=["Mois"]), use_container_width=True)
 
-            if len(valeurs) > 0 and pd.notna(valeurs[0]):
-              date_str = str(valeurs[0]).strip()
-
-              if date_str.startswith("202"):
-                date_propre = date_str[:10]
-
-                record = {
-                    "carriere": "BS",
-                    "mois_annee": nom_feuille,
-                    "date_livraison": date_propre,
-                    "client": (
-                        str(valeurs[1])
-                        if len(valeurs) > 1 and pd.notna(valeurs[1])
-                        else ""
-                    ),
-                    "produit": (
-                        str(valeurs[2])
-                        if len(valeurs) > 2 and pd.notna(valeurs[2])
-                        else ""
-                    ),
-                    "qte_tonnes": (
-                        float(valeurs[3])
-                        if len(valeurs) > 3
-                        and pd.notna(valeurs[3])
-                        and isinstance(valeurs[3], (int, float))
-                        else 0
-                    ),
-                    "qte_m3": (
-                        float(valeurs[4])
-                        if len(valeurs) > 4
-                        and pd.notna(valeurs[4])
-                        and isinstance(valeurs[4], (int, float))
-                        else 0
-                    ),
-                    "montant_ht": (
-                        float(valeurs[7])
-                        if len(valeurs) > 7
-                        and pd.notna(valeurs[7])
-                        and isinstance(valeurs[7], (int, float))
-                        else 0
-                    ),
-                    "chantier": (
-                        str(valeurs[10])
-                        if len(valeurs) > 10 and pd.notna(valeurs[10])
-                        else ""
-                    ),
-                }
-                records_a_inserer.append(record)
-
-          if records_a_inserer:
-            try:
-              supabase.table("livraisons_carrieres").insert(
-                  records_a_inserer
-              ).execute()
-              total_insered += len(records_a_inserer)
-            except Exception as db_err:
-              st.warning(f"Erreur sur la feuille {nom_feuille}: {db_err}")
-
-          i += 1
-          bar.progress(i / total_feuilles)
-
-        st.cache_data.clear()
-        st.success(
-            f"Terminé ! {total_insered} lignes importées. Allez sur 'Tableau"
-            " de Bord'."
-        )
-
-    except Exception as e:
-      st.error(f"Une erreur est survenue : {e}")
+# ---------- Export ----------
+buf = io.BytesIO()
+with pd.ExcelWriter(buf, engine="openpyxl") as w:
+    f.drop(columns=["Mois"]).to_excel(w, sheet_name="Détail", index=False)
+    f.groupby("Mois")["Montant HT Net"].sum().to_excel(w, sheet_name="Par mois")
+    f.groupby(c_client)["Montant HT Net"].sum().to_excel(w, sheet_name="Par client")
+    f.groupby(c_produit)["Montant HT Net"].sum().to_excel(w, sheet_name="Par produit")
+st.download_button("⬇️ Exporter la sélection (Excel)", buf.getvalue(),
+                   file_name="livraisons_filtrees.xlsx",
+                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
