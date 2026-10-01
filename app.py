@@ -138,8 +138,10 @@ else:
 df["Montant HT Net"] = df["Montant HT Net"].fillna(0)
 
 # ---------- Nettoyage ----------
-df[c_client] = df[c_client].astype(str).str.strip()
-df[c_produit] = df[c_produit].astype(str).str.strip()
+# colonnes de travail internes (évite tout conflit de noms avec le fichier source)
+df["Client"] = df[c_client].astype(str).str.strip()
+df["Produit"] = df[c_produit].astype(str).str.strip()
+c_client, c_produit = "Client", "Produit"
 df = df[~df[c_client].str.lower().isin(["", "nan", "none"])]
 # lignes de total / sous-total
 masque_total = (df[c_client].str.lower().str.contains("total")
@@ -169,9 +171,9 @@ if df.empty:
 
 # ---------- Filtres ----------
 st.sidebar.subheader("Filtres")
-mois = st.sidebar.multiselect("Mois", sorted(df["Mois"].unique()))
-clients = st.sidebar.multiselect("Client", sorted(df[c_client].unique()))
-produits = st.sidebar.multiselect("Produit", sorted(df[c_produit].unique()))
+mois = st.sidebar.multiselect("Mois", sorted(df["Mois"].astype(str).unique(), key=str))
+clients = st.sidebar.multiselect("Client", sorted(df[c_client].astype(str).unique(), key=str))
+produits = st.sidebar.multiselect("Produit", sorted(df[c_produit].astype(str).unique(), key=str))
 
 mn, mx = float(df["Montant HT Net"].min()), float(df["Montant HT Net"].max())
 plage = st.sidebar.slider("Montant HT Net (par ligne)", mn, mx, (mn, mx)) if mn < mx else (mn, mx)
