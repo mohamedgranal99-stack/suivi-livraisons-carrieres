@@ -107,7 +107,7 @@ def devine(mots):
 
 
 def choix(label, mots, optionnel=False):
-    options = ([None] if optionnel else []) + cols
+    options = [None] + cols
     d = devine(mots)
     idx = options.index(d) if d in options else 0
     return st.sidebar.selectbox(label, options, index=idx,
@@ -115,7 +115,7 @@ def choix(label, mots, optionnel=False):
 
 
 st.sidebar.subheader("Correspondance des colonnes")
-c_client = choix("Client", ["client"])
+c_client = choix("Client", ["client", "société", "societe", "raison", "destinataire", "tiers", "chantier"])
 c_produit = choix("Produit", ["produit", "désignation", "designation", "article", "matière",
                               "matiere", "nature"])
 c_date = choix("Date", ["date"], optionnel=True)
@@ -123,6 +123,12 @@ c_qte = choix("Quantité", ["quant", "qté", "qte", "tonnage", "poids"], optionn
 c_pu = choix("Prix unitaire", ["prix", "p.u", "p.u.", "pu"], optionnel=True)
 c_net = choix("Montant HT Net", ["ht net", "net ht", "montant ht", "total ht", "montant"],
               optionnel=True)
+
+if c_client is None or c_produit is None:
+    st.warning("Choisissez dans la barre latérale la colonne **Client** et la colonne **Produit** "
+               "(non détectées automatiquement). Voici les premières lignes lues :")
+    st.dataframe(df.head(15), use_container_width=True)
+    st.stop()
 
 # ---------- Montant HT Net ----------
 if c_net:
