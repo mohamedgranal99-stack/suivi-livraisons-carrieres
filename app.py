@@ -9,18 +9,12 @@ supabase_key = st.secrets["supabase"]["key"]
 supabase = create_client(supabase_url, supabase_key)
 
 st.title("🏗️ Suivi des Livraisons - Carrières")
-st.write(
-    "Importez le rapport mensuel de livraison pour alimenter la base de"
-    " données en ligne."
-)
 
-# 1. Sélection de la carrière
 carriere_selectionnee = st.selectbox(
     "Sélectionnez la Carrière",
     ["BS", "Carrière 2", "Carrière 3", "Carrière 4", "Carrière 5"],
 )
 
-# 2. Upload du fichier Excel du mois
 uploaded_file = st.file_uploader(
     "Glissez-déposez le fichier Excel complet (avec ses 33 feuilles)",
     type=["xlsx", "xls"],
@@ -28,13 +22,18 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file is not None:
   try:
-    # Lecture de TOUTES les feuilles du classeur Excel d'un coup
     toutes_les_feuilles = pd.read_excel(uploaded_file, sheet_name=None)
-
     st.success(
         f"Fichier chargé avec succès ! {len(toutes_les_feuilles)} feuilles"
         " détectées."
     )
+
+    # Afficher un aperçu de la première feuille pour vérifier les colonnes
+    premier_nom = list(toutes_les_feuilles.keys())[0]
+    df_test = pd.read_excel(uploaded_file, sheet_name=premier_nom, header=3)
+    st.write(f"Aperçu des colonnes détectées sur la feuille '{premier_nom}' :")
+    st.write(df_test.columns.tolist())
+    st.dataframe(df_test.head(3))
 
     if st.button("Valider et envoyer tout vers Supabase"):
       total_insered = 0
@@ -43,55 +42,28 @@ if uploaded_file is not None:
 
       i = 0
       for nom_feuille, df in toutes_les_feuilles.items():
-        # Ajustement : les en-têtes réels sont à la ligne 3 (header=3)
-        # On recharge proprement la feuille avec le bon en-tête
-        # (On peut relire la feuille depuis le fichier en sautant les 3 premières lignes)
+        # Lecture de la feuille avec header=3
         df_propre = pd.read_excel(uploaded_file, sheet_name=nom_feuille, header=3)
 
         records_a_inserer = []
         for index, row in df_propre.iterrows():
-          date_val = row.get("Date")
-          client_val = row.get("Client")
-
-          # Vérifier que la ligne contient bien une date et un client valides
-          if pd.notna(date_val) and pd.notna(client_val) and client_val != "nan":
-            # Nettoyage de la date
-            date_str = str(date_val)[:10]
-
+          # On prend la première colonne disponible comme date et la deuxième comme client
+          # pour être sûr de ne rien rater même si les noms de colonnes varient un peu
+          valeurs = row.values
+          if len(valeurs) > 2 and pd.notna(valeurs[0]):
             record = {
                 "carriere": carriere_selectionnee,
-                "mois_annee": nom_feuille,  # Utilise directement le nom de la feuille comme mois (ex: JANVIER-24, SEPT-26)
-                "date_livraison": date_str,
-                "client": str(client_val),
-                "produit": (
-                    str(row.get("Produit"))
-                    if pd.notna(row.get("Produit"))
-                    else ""
-                ),
-                "qte_tonnes": (
-                    float(row.get("Qté en T"))
-                    if pd.notna(row.get("Qté en T"))
-                    else 0
-                ),
-                "qte_m3": (
-                    float(row.get("Qté en M3"))
-                    if pd.notna(row.get("Qté en M3"))
-                    else 0
-                ),
-                "montant_ht": (
-                    float(row.get("Montant HT"))
-                    if pd.notna(row.get("Montant HT"))
-                    else 0
-                ),
-                "chantier": (
-                    str(row.get("Chantier"))
-                    if pd.notna(row.get("Chantier"))
-                    else ""
-                ),
+                "mois_annee": nom_feuille,
+                "date_livraison": str(valeurs[0])[:10],
+                "client": str(valeurs[1]) if pd.notna(valeurs[1]) else "",
+                "produit": str(valeurs[2]) if len(valeurs) > 2 and pd.notna(valeurs[2]) else "",
+                "qte_tonnes": float(valeurs[3]) if len(valeurs) > 3 and pd.notna(valeurs[3]) and isinstance(valeurs[3], (int, float)) else 0,
+                "qte_m3": float(valeurs[4]) if len(valeurs) > 4 and pd.notna(valeurs[4]) and isinstance(valeurs[4], (int, float)) else 0,
+                "montant_ht": float(valeurs[7]) if len(valeurs) > 7 and pd.notna(valeurs[7]) and isinstance(valeurs[7], (int, float)) else 0,
+                "chantier": str(valeurs[10]) if len(valeurs) > 10 and pd.notna(valeurs[10]) else "",
             }
             records_a_inserer.append(record)
 
-        # Insertion par lots dans Supabase si des lignes existent pour cette feuille
         if records_a_inserer:
           supabase.table("livraisons_carrieres").insert(
               records_a_inserer
@@ -102,8 +74,8 @@ if uploaded_file is not None:
         bar.progress(i / total_feuilles)
 
       st.success(
-          f"Terminé ! Un total de {total_insered} lignes ont été importées pour"
-          f" la {carriere_selectionnee} à travers toutes les feuilles."
+          f"Terminé ! Un total de {total_insered} lignes ont été importées avec"
+          " succès."
       )
 
   except Exception as e:
