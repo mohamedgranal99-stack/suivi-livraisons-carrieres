@@ -35,38 +35,70 @@ if uploaded_file is not None:
 
       i = 0
       for nom_feuille, df in toutes_les_feuilles.items():
-        # On lit la feuille en sautant les 3 premières lignes (header=3)
+        # Lecture de la feuille en sautant les 3 premières lignes
         df_propre = pd.read_excel(uploaded_file, sheet_name=nom_feuille, header=3)
 
         records_a_inserer = []
         for index, row in df_propre.iterrows():
           valeurs = row.values
 
-          # Vérification de sécurité : on s'assure qu'on a bien une date et que ce n'est pas le mot "Date"
-          date_val = str(valeurs[0]) if len(valeurs) > 0 and pd.notna(valeurs[0]) else ""
-          if date_val and "Date" not in date_val and "Unnamed" not in date_val:
-            
-            # Nettoyage sécurisé de la date (on prend les 10 premiers caractères ex: 2024-01-26)
-            date_propre = date_val[:10] if len(date_val) >= 10 else None
+          if len(valeurs) > 0 and pd.notna(valeurs[0]):
+            date_str = str(valeurs[0]).strip()
 
-            if date_propre:
+            # SÉCURITÉ : On vérifie que la valeur ressemble vraiment à une date (ex: commence par 202)
+            # Cela élimine automatiquement les lignes de totaux comme "Total livr", "Total", etc.
+            if date_str.startswith("202"):
+              date_propre = date_str[:10]
+
               record = {
                   "carriere": carriere_selectionnee,
                   "mois_annee": nom_feuille,
                   "date_livraison": date_propre,
-                  "client": str(valeurs[1]) if len(valeurs) > 1 and pd.notna(valeurs[1]) else "",
-                  "produit": str(valeurs[2]) if len(valeurs) > 2 and pd.notna(valeurs[2]) else "",
-                  "qte_tonnes": float(valeurs[3]) if len(valeurs) > 3 and pd.notna(valeurs[3]) and isinstance(valeurs[3], (int, float)) else 0,
-                  "qte_m3": float(valeurs[4]) if len(valeurs) > 4 and pd.notna(valeurs[4]) and isinstance(valeurs[4], (int, float)) else 0,
-                  "montant_ht": float(valeurs[7]) if len(valeurs) > 7 and pd.notna(valeurs[7]) and isinstance(valeurs[7], (int, float)) else 0,
-                  "chantier": str(valeurs[10]) if len(valeurs) > 10 and pd.notna(valeurs[10]) else "",
+                  "client": (
+                      str(valeurs[1])
+                      if len(valeurs) > 1 and pd.notna(valeurs[1])
+                      else ""
+                  ),
+                  "produit": (
+                      str(valeurs[2])
+                      if len(valeurs) > 2 and pd.notna(valeurs[2])
+                      else ""
+                  ),
+                  "qte_tonnes": (
+                      float(valeurs[3])
+                      if len(valeurs) > 3
+                      and pd.notna(valeurs[3])
+                      and isinstance(valeurs[3], (int, float))
+                      else 0
+                  ),
+                  "qte_m3": (
+                      float(valeurs[4])
+                      if len(valeurs) > 4
+                      and pd.notna(valeurs[4])
+                      and isinstance(valeurs[4], (int, float))
+                      else 0
+                  ),
+                  "montant_ht": (
+                      float(valeurs[7])
+                      if len(valeurs) > 7
+                      and pd.notna(valeurs[7])
+                      and isinstance(valeurs[7], (int, float))
+                      else 0
+                  ),
+                  "chantier": (
+                      str(valeurs[10])
+                      if len(valeurs) > 10 and pd.notna(valeurs[10])
+                      else ""
+                  ),
               }
               records_a_inserer.append(record)
 
         # Insertion par lots dans Supabase pour cette feuille
         if records_a_inserer:
           try:
-            supabase.table("livraisons_carrieres").insert(records_a_inserer).execute()
+            supabase.table("livraisons_carrieres").insert(
+                records_a_inserer
+            ).execute()
             total_insered += len(records_a_inserer)
           except Exception as db_err:
             st.warning(f"Erreur sur la feuille {nom_feuille}: {db_err}")
@@ -75,7 +107,8 @@ if uploaded_file is not None:
         bar.progress(i / total_feuilles)
 
       st.success(
-          f"Terminé avec succès ! Un total de {total_insered} lignes ont été importées dans Supabase."
+          f"Terminé avec succès ! Un total de {total_insered} lignes de"
+          " livraison ont été importées dans Supabase sans erreur."
       )
 
   except Exception as e:
