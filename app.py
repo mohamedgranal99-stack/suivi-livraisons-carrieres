@@ -154,4 +154,88 @@ source = ["Nom de la feuille", "Colonne date"]
 defaut = 0 if df["Mois_feuille"].notna().all() else 1
 if not c_date:
     defaut = 0
-src = st.sidebar.radio("Mois calculé à parti
+src = st.sidebar.radio("Mois calculé à partir de", source, index=defaut)
+
+if src == "Colonne date" and c_date:
+    d = pd.to_datetime(df[c_date], errors="coerce", dayfirst=True)
+    df["Mois"] = d.dt.to_period("M").astype(str)
+    df = df[df["Mois"] != "NaT"]
+else:
+    df["Mois"] = df["Mois_feuille"].fillna(df["Feuille"])
+
+if df.empty:
+    st.warning("Aucune ligne exploitable après nettoyage. Vérifiez les colonnes choisies.")
+    st.stop()
+
+# ---------- Filtres ----------
+st.sidebar.subheader("Filtres")
+mois = st.sidebar.multiselect("Mois", sorted(df["Mois"].unique()))
+clients = st.sidebar.multiselect("Client", sorted(df[c_client].unique()))
+produits = st.sidebar.multiselect("Produit", sorted(df[c_produit].unique()))
+
+mn, mx = float(df["Montant HT Net"].min()), float(df["Montant HT Net"].max())
+plage = st.sidebar.slider("Montant HT Net (par ligne)", mn, mx, (mn, mx)) if mn < mx else (mn, mx)
+
+f = df.copy()
+if mois:
+    f = f[f["Mois"].isin(mois)]
+if clients:
+    f = f[f[c_client].isin(clients)]
+if produits:
+    f = f[f[c_produit].isin(produits)]
+f = f[f["Montant HT Net"].between(plage[0], plage[1])]
+
+
+def fmt(x):
+    return f"{x:,.2f}".replace(",", " ")
+
+
+# ---------- Indicateurs ----------
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Montant HT Net total", fmt(f["Montant HT Net"].sum()))
+k2.metric("Nb de lignes", f"{len(f):,}".replace(",", " "))
+k3.metric("Nb de clients", f[c_client].nunique())
+if c_qte:
+    k4.metric("Quantité totale", fmt(f["Quantité"].sum()))
+
+# ---------- Onglets ----------
+t1, t2, t3, t4 = st.tabs(["📅 Par mois", "👥 Par client", "🪨 Par produit", "📋 Détail"])
+
+with t1:
+    m = f.groupby("Mois", as_index=False)["Montant HT Net"].sum()
+    st.bar_chart(m, x="Mois", y="Montant HT Net")
+    st.dataframe(m, use_container_width=True)
+
+with t2:
+    c = (f.groupby(c_client, as_index=False)["Montant HT Net"].sum()
+         .sort_values("Montant HT Net", ascending=False))
+    st.bar_chart(c, x=c_client, y="Montant HT Net")
+    st.dataframe(c, use_container_width=True)
+    st.markdown("**Client × Mois**")
+    st.dataframe(f.pivot_table(index=c_client, columns="Mois", values="Montant HT Net",
+                               aggfunc="sum", fill_value=0, margins=True, margins_name="Total"),
+                 use_container_width=True)
+
+with t3:
+    p = (f.groupby(c_produit, as_index=False)["Montant HT Net"].sum()
+         .sort_values("Montant HT Net", ascending=False))
+    st.bar_chart(p, x=c_produit, y="Montant HT Net")
+    st.dataframe(p, use_container_width=True)
+    st.markdown("**Produit × Client**")
+    st.dataframe(f.pivot_table(index=c_produit, columns=c_client, values="Montant HT Net",
+                               aggfunc="sum", fill_value=0, margins=True, margins_name="Total"),
+                 use_container_width=True)
+
+with t4:
+    st.dataframe(f.drop(columns=["Mois_feuille"]), use_container_width=True)
+
+# ---------- Export ----------
+buf = io.BytesIO()
+with pd.ExcelWriter(buf, engine="openpyxl") as w:
+    f.drop(columns=["Mois_feuille"]).to_excel(w, sheet_name="Détail", index=False)
+    f.groupby("Mois")["Montant HT Net"].sum().to_excel(w, sheet_name="Par mois")
+    f.groupby(c_client)["Montant HT Net"].sum().to_excel(w, sheet_name="Par client")
+    f.groupby(c_produit)["Montant HT Net"].sum().to_excel(w, sheet_name="Par produit")
+st.download_button("⬇️ Exporter la sélection (Excel)", buf.getvalue(),
+                   file_name="livraisons_filtrees.xlsx",
+                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
