@@ -3,113 +3,217 @@ import pandas as pd
 from supabase import create_client
 import streamlit as st
 
+# Configuration de la page Streamlit
+st.set_page_config(
+    page_title="Suivi des Livraisons - Carrière", page_icon="🏗️", layout="wide"
+)
+
 # Connexion à Supabase
 supabase_url = st.secrets["supabase"]["url"]
 supabase_key = st.secrets["supabase"]["key"]
 supabase = create_client(supabase_url, supabase_key)
 
-st.title("🏗️ Suivi des Livraisons - Carrières")
+st.title("🏗️ Tableau de Bord - Suivi des Livraisons")
 
-carriere_selectionnee = st.selectbox(
-    "Sélectionnez la Carrière",
-    ["BS", "Carrière 2", "Carrière 3", "Carrière 4", "Carrière 5"],
+# Menu latéral pour basculer entre le Dashboard et l'Importation
+menu = st.sidebar.selectbox(
+    "Navigation", ["📊 Tableau de Bord", "📥 Importer un nouveau fichier"]
 )
 
-uploaded_file = st.file_uploader(
-    "Glissez-déposez le fichier Excel complet (avec ses 33 feuilles)",
-    type=["xlsx", "xls"],
-)
+# --- 1. FONCTION DE CHARGEMENT DES DONNÉES DEPUIS SUPABASE ---
+@st.cache_data(ttl=60)
+def charger_donnees():
+  response = (
+      supabase.table("livraisons_carrieres")
+      .select("*")
+      .eq("carriere", "BS")
+      .execute()
+  )
+  data = response.data
+  if data:
+    return pd.DataFrame(data)
+  else:
+    return pd.DataFrame()
 
-if uploaded_file is not None:
-  try:
-    toutes_les_feuilles = pd.read_excel(uploaded_file, sheet_name=None)
-    st.success(
-        f"Fichier chargé avec succès ! {len(toutes_les_feuilles)} feuilles"
-        " détectées."
+
+df_global = charger_donnees()
+
+# ==========================================
+# PARTIE 1 : TABLEAU DE BORD (DASHBOARD)
+# ==========================================
+if menu == "📊 Tableau de Bord":
+  if df_global.empty:
+    st.warning(
+        "Aucune donnée trouvée dans Supabase. Veuillez importer un fichier via"
+        " le menu latéral."
+    )
+  else:
+    st.sidebar.header("🔍 Filtres d'analyse")
+
+    # Filtre par Mois / Année
+    mois_disponibles = sorted(df_global["mois_annee"].dropna().unique())
+    mois_selectionnes = st.sidebar.multiselect(
+        "Filtrer par Mois / Période",
+        mois_disponibles,
+        default=mois_disponibles,
     )
 
-    if st.button("Valider et envoyer tout vers Supabase"):
-      total_insered = 0
-      bar = st.progress(0)
-      total_feuilles = len(toutes_les_feuilles)
+    # Filtre par Client
+    clients_disponibles = sorted(df_global["client"].dropna().unique())
+    client_selectionne = st.sidebar.multiselect(
+        "Filtrer par Client", clients_disponibles
+    )
 
-      i = 0
-      for nom_feuille, df in toutes_les_feuilles.items():
-        # Lecture de la feuille en sautant les 3 premières lignes
-        df_propre = pd.read_excel(uploaded_file, sheet_name=nom_feuille, header=3)
+    # Application des filtres
+    df_Filtre = df_global[df_global["mois_annee"].isin(mois_selectionnes)]
+    if client_selectionne:
+      df_Filtre = df_Filtre[df_Filtre["client"].isin(client_selectionne)]
 
-        records_a_inserer = []
-        for index, row in df_propre.iterrows():
-          valeurs = row.values
+    # --- KPIs PRINCIPAUX ---
+    st.subheader("📈 Indicateurs Clés de Performance (KPIs)")
+    total_tonnes = df_Filtre["qte_tonnes"].sum()
+    total_m3 = df_Filtre["qte_m3"].sum()
+    total_montant = df_Filtre["montant_ht"].sum()
 
-          if len(valeurs) > 0 and pd.notna(valeurs[0]):
-            date_str = str(valeurs[0]).strip()
+    col1, col2, col3 = st.columns(3)
+    col1.metric("📦 Tonnage Total (T)", f"{total_tonnes:,.2f} T")
+    col2.metric("📐 Volume Total (M3)", f"{total_m3:,.2f} m³")
+    col3.metric("💰 Chiffre d'Affaires HT", f"{total_montant:,.2f} Dh")
 
-            # SÉCURITÉ : On vérifie que la valeur ressemble vraiment à une date (ex: commence par 202)
-            # Cela élimine automatiquement les lignes de totaux comme "Total livr", "Total", etc.
-            if date_str.startswith("202"):
-              date_propre = date_str[:10]
+    st.markdown("---")
 
-              record = {
-                  "carriere": carriere_selectionnee,
-                  "mois_annee": nom_feuille,
-                  "date_livraison": date_propre,
-                  "client": (
-                      str(valeurs[1])
-                      if len(valeurs) > 1 and pd.notna(valeurs[1])
-                      else ""
-                  ),
-                  "produit": (
-                      str(valeurs[2])
-                      if len(valeurs) > 2 and pd.notna(valeurs[2])
-                      else ""
-                  ),
-                  "qte_tonnes": (
-                      float(valeurs[3])
-                      if len(valeurs) > 3
-                      and pd.notna(valeurs[3])
-                      and isinstance(valeurs[3], (int, float))
-                      else 0
-                  ),
-                  "qte_m3": (
-                      float(valeurs[4])
-                      if len(valeurs) > 4
-                      and pd.notna(valeurs[4])
-                      and isinstance(valeurs[4], (int, float))
-                      else 0
-                  ),
-                  "montant_ht": (
-                      float(valeurs[7])
-                      if len(valeurs) > 7
-                      and pd.notna(valeurs[7])
-                      and isinstance(valeurs[7], (int, float))
-                      else 0
-                  ),
-                  "chantier": (
-                      str(valeurs[10])
-                      if len(valeurs) > 10 and pd.notna(valeurs[10])
-                      else ""
-                  ),
-              }
-              records_a_inserer.append(record)
+    # --- GRAPHIQUES ET ANALYSES ---
+    st.subheader("📊 Évolution des Livraisons en Tonnes")
+    if not df_Filtre.empty:
+      # Regroupement par mois pour le graphique
+      df_chart = (
+          df_Filtre.groupby("mois_annee")["qte_tonnes"].sum().reset_index()
+      )
+      st.bar_chart(df_chart.set_index("mois_annee"))
 
-        # Insertion par lots dans Supabase pour cette feuille
-        if records_a_inserer:
-          try:
-            supabase.table("livraisons_carrieres").insert(
-                records_a_inserer
-            ).execute()
-            total_insered += len(records_a_inserer)
-          except Exception as db_err:
-            st.warning(f"Erreur sur la feuille {nom_feuille}: {db_err}")
+    st.markdown("---")
 
-        i += 1
-        bar.progress(i / total_feuilles)
+    # --- TABLEAU DÉTAILLÉ ---
+    st.subheader("📋 Détail des Livraisons")
+    st.write(f"Affichage de {len(df_Filtre)} lignes filtrées :")
+    st.dataframe(
+        df_Filtre[
+            [
+                "mois_annee",
+                "date_livraison",
+                "client",
+                "produit",
+                "qte_tonnes",
+                "qte_m3",
+                "montant_ht",
+                "chantier",
+            ]
+        ],
+        use_container_width=True,
+    )
 
+# ==========================================
+# PARTIE 2 : IMPORTATION DES FICHIERS
+# ==========================================
+elif menu == "📥 Importer un nouveau fichier":
+  st.header("📥 Importer un classeur de livraisons")
+  st.write(
+      "Glissez-déposez le fichier Excel complet (avec ses 33 feuilles) pour"
+      " actualiser la base de données."
+  )
+
+  uploaded_file = st.file_uploader(
+      "Fichier Excel (.xlsx)", type=["xlsx", "xls"]
+  )
+
+  if uploaded_file is not None:
+    try:
+      toutes_les_feuilles = pd.read_excel(uploaded_file, sheet_name=None)
       st.success(
-          f"Terminé avec succès ! Un total de {total_insered} lignes de"
-          " livraison ont été importées dans Supabase sans erreur."
+          f"Fichier chargé avec succès ! {len(toutes_les_feuilles)} feuilles"
+          " détectées."
       )
 
-  except Exception as e:
-    st.error(f"Une erreur est survenue : {e}")
+      if st.button("Valider et envoyer tout vers Supabase"):
+        total_insered = 0
+        bar = st.progress(0)
+        total_feuilles = len(toutes_les_feuilles)
+
+        i = 0
+        for nom_feuille, df in toutes_les_feuilles.items():
+          df_propre = pd.read_excel(
+              uploaded_file, sheet_name=nom_feuille, header=3
+          )
+
+          records_a_inserer = []
+          for index, row in df_propre.iterrows():
+            valeurs = row.values
+
+            if len(valeurs) > 0 and pd.notna(valeurs[0]):
+              date_str = str(valeurs[0]).strip()
+
+              if date_str.startswith("202"):
+                date_propre = date_str[:10]
+
+                record = {
+                    "carriere": "BS",
+                    "mois_annee": nom_feuille,
+                    "date_livraison": date_propre,
+                    "client": (
+                        str(valeurs[1])
+                        if len(valeurs) > 1 and pd.notna(valeurs[1])
+                        else ""
+                    ),
+                    "produit": (
+                        str(valeurs[2])
+                        if len(valeurs) > 2 and pd.notna(valeurs[2])
+                        else ""
+                    ),
+                    "qte_tonnes": (
+                        float(valeurs[3])
+                        if len(valeurs) > 3
+                        and pd.notna(valeurs[3])
+                        and isinstance(valeurs[3], (int, float))
+                        else 0
+                    ),
+                    "qte_m3": (
+                        float(valeurs[4])
+                        if len(valeurs) > 4
+                        and pd.notna(valeurs[4])
+                        and isinstance(valeurs[4], (int, float))
+                        else 0
+                    ),
+                    "montant_ht": (
+                        float(valeurs[7])
+                        if len(valeurs) > 7
+                        and pd.notna(valeurs[7])
+                        and isinstance(valeurs[7], (int, float))
+                        else 0
+                    ),
+                    "chantier": (
+                        str(valeurs[10])
+                        if len(valeurs) > 10 and pd.notna(valeurs[10])
+                        else ""
+                    ),
+                }
+                records_a_inserer.append(record)
+
+          if records_a_inserer:
+            try:
+              supabase.table("livraisons_carrieres").insert(
+                  records_a_inserer
+              ).execute()
+              total_insered += len(records_a_inserer)
+            except Exception as db_err:
+              st.warning(f"Erreur sur la feuille {nom_feuille}: {db_err}")
+
+          i += 1
+          bar.progress(i / total_feuilles)
+
+        st.success(
+            f"Terminé ! {total_insered} lignes importées. Rechargez la page"
+            " pour voir le tableau de bord mis à jour."
+        )
+
+    except Exception as e:
+      st.error(f"Une erreur est survenue : {e}")
