@@ -20,6 +20,7 @@ menu = st.sidebar.selectbox(
     "Navigation", ["📊 Tableau de Bord", "📥 Importer un nouveau fichier"]
 )
 
+
 # --- 1. FONCTION DE CHARGEMENT DES DONNÉES DEPUIS SUPABASE ---
 @st.cache_data(ttl=60)
 def charger_donnees():
@@ -38,6 +39,11 @@ def charger_donnees():
 
 df_global = charger_donnees()
 
+# Bouton pratique pour vider le cache manuellement dans la barre latérale
+if st.sidebar.button("🔄 Rafraîchir les données"):
+  st.cache_data.clear()
+  st.rerun()
+
 # ==========================================
 # PARTIE 1 : TABLEAU DE BORD (DASHBOARD)
 # ==========================================
@@ -50,7 +56,7 @@ if menu == "📊 Tableau de Bord":
   else:
     st.sidebar.header("🔍 Filtres d'analyse")
 
-    # Filtre par Mois / Année
+    # Filtre par Mois / Année (Tous les mois, y compris les nouveaux, sont sélectionnés par défaut)
     mois_disponibles = sorted(df_global["mois_annee"].dropna().unique())
     mois_selectionnes = st.sidebar.multiselect(
         "Filtrer par Mois / Période",
@@ -72,7 +78,7 @@ if menu == "📊 Tableau de Bord":
     # --- KPIs PRINCIPAUX ---
     st.subheader("📈 Indicateurs Clés de Performance (KPIs)")
     total_tonnes = df_Filtre["qte_tonnes"].sum()
-    total_m3 = df_Filtre["qte_m3"].sum()
+    total_m3 = df_Fils_m3 = df_Filtre["qte_m3"].sum()
     total_montant = df_Filtre["montant_ht"].sum()
 
     col1, col2, col3 = st.columns(3)
@@ -85,7 +91,6 @@ if menu == "📊 Tableau de Bord":
     # --- GRAPHIQUES ET ANALYSES ---
     st.subheader("📊 Évolution des Livraisons en Tonnes")
     if not df_Filtre.empty:
-      # Regroupement par mois pour le graphique
       df_chart = (
           df_Filtre.groupby("mois_annee")["qte_tonnes"].sum().reset_index()
       )
@@ -210,9 +215,12 @@ elif menu == "📥 Importer un nouveau fichier":
           i += 1
           bar.progress(i / total_feuilles)
 
+        # IMPORTANT : On vide le cache automatiquement après l'import pour forcer la mise à jour
+        st.cache_data.clear()
+
         st.success(
-            f"Terminé ! {total_insered} lignes importées. Rechargez la page"
-            " pour voir le tableau de bord mis à jour."
+            f"Terminé ! {total_insered} lignes importées. Le cache a été"
+            " nettoyé, retournez sur le 'Tableau de Bord'."
         )
 
     except Exception as e:
