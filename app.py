@@ -98,35 +98,38 @@ with st.expander("👀 Aperçu des données brutes", expanded=False):
     st.dataframe(df.head(30), use_container_width=True)
 
 
-# ---------- Choix des colonnes ----------
+# ---------- Détection automatique des colonnes (silencieuse) ----------
 def devine(mots):
-    for c in cols:
-        if any(m in c.lower() for m in mots):
-            return c
+    """Renvoie la 1ère colonne correspondant au mot-clé le plus prioritaire."""
+    for m in mots:
+        for c in cols:
+            if m in c.lower():
+                return c
     return None
 
 
-def choix(label, mots, optionnel=False):
-    options = [None] + cols
+def colonne(label, mots, requis=False):
     d = devine(mots)
-    idx = options.index(d) if d in options else 0
-    return st.sidebar.selectbox(label, options, index=idx,
-                                format_func=lambda x: "— aucune —" if x is None else x)
+    if d is None and requis:
+        # affiché UNIQUEMENT si la détection automatique échoue
+        d = st.sidebar.selectbox(f"{label} (non détectée, à choisir)", [None] + cols,
+                                 format_func=lambda x: "— choisir —" if x is None else x)
+    return d
 
 
-st.sidebar.subheader("Correspondance des colonnes")
-c_client = choix("Client", ["client", "société", "societe", "raison", "destinataire", "tiers", "chantier"])
-c_produit = choix("Produit", ["produit", "désignation", "designation", "article", "matière",
-                              "matiere", "nature"])
-c_date = choix("Date", ["date"], optionnel=True)
-c_qte = choix("Quantité", ["quant", "qté", "qte", "tonnage", "poids"], optionnel=True)
-c_pu = choix("Prix unitaire", ["prix", "p.u", "p.u.", "pu"], optionnel=True)
-c_net = choix("Montant HT Net", ["ht net", "net ht", "montant ht", "total ht", "montant"],
-              optionnel=True)
+c_client = colonne("Client", ["client", "société", "societe", "raison", "destinataire",
+                              "tiers", "chantier"], requis=True)
+c_produit = colonne("Produit", ["produit", "désignation", "designation", "article", "matière",
+                                "matiere", "nature"], requis=True)
+c_date = colonne("Date", ["date"], requis=True)
+c_qte = colonne("Quantité", ["qté en t", "qte en t", "tonnage", "quant", "qté", "qte", "poids"])
+c_pu = colonne("Prix unitaire", ["p.u ht", "p.u", "prix", "pu"])
+c_net = colonne("Montant HT Net", ["montant ht net", "ht net", "net ht", "montant ht",
+                                   "total ht", "montant"])
 
-if c_client is None or c_produit is None:
-    st.warning("Choisissez dans la barre latérale la colonne **Client** et la colonne **Produit** "
-               "(non détectées automatiquement). Voici les premières lignes lues :")
+if c_client is None or c_produit is None or c_date is None:
+    st.warning("Certaines colonnes n'ont pas été détectées : choisissez-les dans la barre "
+               "latérale. Voici les premières lignes lues :")
     st.dataframe(df.head(15), use_container_width=True)
     st.stop()
 
@@ -137,8 +140,9 @@ elif c_qte and c_pu:
     df["Montant HT Net"] = to_num(df[c_qte]) * to_num(df[c_pu])
     st.sidebar.caption("Montant HT Net = Quantité × Prix unitaire")
 else:
-    st.error("Sélectionnez la colonne « Montant HT Net » (ou Quantité + Prix unitaire) "
-             "dans la barre latérale. Vérifiez l'aperçu ci-dessus pour voir les noms de colonnes.")
+    st.error("Colonne « Montant HT » introuvable (ni Quantité + Prix unitaire). "
+             "Vérifiez les noms de colonnes de votre fichier.")
+    st.dataframe(df.head(15), use_container_width=True)
     st.stop()
 
 df["Montant HT Net"] = df["Montant HT Net"].fillna(0)
@@ -157,19 +161,10 @@ df = df[~masque_total]
 if c_qte:
     df["Quantité"] = to_num(df[c_qte]).fillna(0)
 
-# ---------- Mois ----------
-source = ["Nom de la feuille", "Colonne date"]
-defaut = 0 if df["Mois_feuille"].notna().all() else 1
-if not c_date:
-    defaut = 0
-src = st.sidebar.radio("Mois calculé à partir de", source, index=defaut)
-
-if src == "Colonne date" and c_date:
-    d = pd.to_datetime(df[c_date], errors="coerce", dayfirst=True)
-    df["Mois"] = d.dt.to_period("M").astype(str)
-    df = df[df["Mois"] != "NaT"]
-else:
-    df["Mois"] = df["Mois_feuille"].fillna(df["Feuille"])
+# ---------- Mois (à partir de la colonne date) ----------
+d = pd.to_datetime(df[c_date], errors="coerce", dayfirst=True)
+df["Mois"] = d.dt.to_period("M").astype(str)
+df = df[df["Mois"] != "NaT"]
 
 if df.empty:
     st.warning("Aucune ligne exploitable après nettoyage. Vérifiez les colonnes choisies.")
