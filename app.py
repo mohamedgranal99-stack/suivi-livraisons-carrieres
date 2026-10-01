@@ -22,7 +22,7 @@ menu = st.sidebar.selectbox(
 
 
 # --- 1. FONCTION DE CHARGEMENT DES DONNÉES DEPUIS SUPABASE ---
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=10)  # TTL réduit à 10 secondes pour actualiser plus vite
 def charger_donnees():
   response = (
       supabase.table("livraisons_carrieres")
@@ -39,7 +39,7 @@ def charger_donnees():
 
 df_global = charger_donnees()
 
-# Bouton pratique pour vider le cache manuellement dans la barre latérale
+# Bouton de rafraîchissement manuel
 if st.sidebar.button("🔄 Rafraîchir les données"):
   st.cache_data.clear()
   st.rerun()
@@ -54,9 +54,23 @@ if menu == "📊 Tableau de Bord":
         " le menu latéral."
     )
   else:
+    # --- SECTION DE CONTRÔLE : CE QUI EST DANS LA BASE ---
+    st.subheader("🔍 État des données enregistrées dans Supabase (par mois)")
+    # On groupe par mois pour voir exactement combien de lignes chaque mois contient en base
+    df_resume = (
+        df_global.groupby("mois_annee")
+        .agg(
+            Lignes_Injectees=("id", "count"),
+            Tonnage_Total=("qte_tonnes", "sum"),
+        )
+        .reset_index()
+    )
+    st.dataframe(df_resume, use_container_width=True)
+    st.markdown("---")
+
     st.sidebar.header("🔍 Filtres d'analyse")
 
-    # Filtre par Mois / Année (Tous les mois, y compris les nouveaux, sont sélectionnés par défaut)
+    # Filtre par Mois / Année
     mois_disponibles = sorted(df_global["mois_annee"].dropna().unique())
     mois_selectionnes = st.sidebar.multiselect(
         "Filtrer par Mois / Période",
@@ -78,7 +92,7 @@ if menu == "📊 Tableau de Bord":
     # --- KPIs PRINCIPAUX ---
     st.subheader("📈 Indicateurs Clés de Performance (KPIs)")
     total_tonnes = df_Filtre["qte_tonnes"].sum()
-    total_m3 = df_Fils_m3 = df_Filtre["qte_m3"].sum()
+    total_m3 = df_Filtre["qte_m3"].sum()
     total_montant = df_Filtre["montant_ht"].sum()
 
     col1, col2, col3 = st.columns(3)
@@ -215,12 +229,10 @@ elif menu == "📥 Importer un nouveau fichier":
           i += 1
           bar.progress(i / total_feuilles)
 
-        # IMPORTANT : On vide le cache automatiquement après l'import pour forcer la mise à jour
         st.cache_data.clear()
-
         st.success(
-            f"Terminé ! {total_insered} lignes importées. Le cache a été"
-            " nettoyé, retournez sur le 'Tableau de Bord'."
+            f"Terminé ! {total_insered} lignes importées. Allez sur 'Tableau"
+            " de Bord'."
         )
 
     except Exception as e:
