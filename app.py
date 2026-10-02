@@ -416,6 +416,7 @@ def sauvegarde_zip():
         z.writestr("carrieres.json", json.dumps(
             {n: {"carriere": carriere_de(n, meta), "ajoute": date_ajout(n, meta)} for n in noms},
             ensure_ascii=False, indent=2))
+        z.writestr("bons_commande.json", json.dumps(charge_bc(), ensure_ascii=False, indent=2))
     return buf.getvalue()
 
 
@@ -447,8 +448,163 @@ def restaure_zip(contenu):
             m[nom] = {"carriere": car if car in CARRIERES else (detecte_carriere(nom) or NON_CLASSEE),
                       "ajoute": ajoute}
             nb += 1
+        nb_bc = 0
+        try:
+            bcs_zip = json.loads(z.read("bons_commande.json").decode("utf-8"))
+        except Exception:
+            bcs_zip = []
+        if isinstance(bcs_zip, list) and bcs_zip:
+            bcs_actuels = charge_bc()
+            ids = {b.get("id") for b in bcs_actuels}
+            for b in bcs_zip:
+                try:
+                    if isinstance(b, dict) and b.get("id") and b["id"] not in ids and b["ref"] and b["client"]:
+                        bcs_actuels.append({
+                            "id": str(b["id"]), "ref": str(b["ref"]), "client": str(b["client"]),
+                            "chantier": str(b.get("chantier") or ""), "montant": float(b["montant"]),
+                            "date_debut": str(b.get("date_debut") or ""), "date_fin": str(b.get("date_fin") or ""),
+                            "clos": bool(b.get("clos")), "note": str(b.get("note") or ""),
+                            "cree_par": str(b.get("cree_par") or ""), "cree_le": str(b.get("cree_le") or "")})
+                        ids.add(b["id"])
+                        nb_bc += 1
+                except (KeyError, TypeError, ValueError):
+                    continue
+            sauve_bc(bcs_actuels)
     sauve_meta(m)
-    return nb, ignores
+    return nb, ignores, nb_bc
+
+
+# ---------- Bons de commande clients ----------
+FICHIER_BC = os.path.join(DOSSIER, "bons_commande.json")
+TOUS = "(tous les chantiers)"
+STATUT_OK, STATUT_PROCHE = "🟢 OK", "🟠 Proche du plafond"
+STATUT_DEPASSE, STATUT_CLOS = "🔴 Dépassé", "⚪ Clôturé"
+
+
+def charge_bc():
+    try:
+        with open(FICHIER_BC, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, list) else []
+    except Exception:
+        return []
+
+
+def sauve_bc(liste):
+    tmp = FICHIER_BC + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(liste, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, FICHIER_BC)
+
+
+def date_iso(v):
+    return v.isoformat() if hasattr(v, "isoformat") else ""
+
+
+def _bc_valide(ref, client, montant, periode, d1, d2, autres, ignorer_id=None):
+    """Renvoie un message d'erreur, ou None si les champs sont corrects."""
+    if not ref:
+        return "Saisissez la référence du bon de commande."
+    if not client:
+        return "Choisissez le client."
+    if montant <= 0:
+        return "Le montant NET HT doit être supérieur à 0."
+    if any(b["ref"].lower() == ref.lower() and b["id"] != ignorer_id for b in autres):
+        return f"La référence « {ref} » existe déjà."
+    if periode and d1 and d2 and d1 > d2:
+        return "La date de début doit précéder la date de fin."
+    return None
+
+
+def cb_bc_ajoute():
+    ss = st.session_state
+    bcs = charge_bc()
+    ref = (ss.get("bc_ref") or "").strip()
+    client = ss.get("bc_client")
+    chantier = ss.get(f"bc_chantier_{client}")
+    montant = float(ss.get("bc_montant") or 0)
+    periode = bool(ss.get("bc_periode"))
+    d1, d2 = (ss.get("bc_d1"), ss.get("bc_d2")) if periode else (None, None)
+    erreur = _bc_valide(ref, client, montant, periode, d1, d2, bcs)
+    if erreur:
+        msg("error", erreur)
+        return
+    bcs.append({"id": pysecrets.token_hex(4), "ref": ref, "client": client,
+                "chantier": "" if chantier in (None, TOUS) else chantier,
+                "montant": montant, "date_debut": date_iso(d1), "date_fin": date_iso(d2),
+                "clos": False, "note": (ss.get("bc_note") or "").strip(),
+                "cree_par": moi() or "", "cree_le": datetime.now().isoformat(timespec="seconds")})
+    sauve_bc(bcs)
+    msg("success", f"Bon de commande « {ref} » enregistré.")
+    ss["bc_ref"], ss["bc_montant"], ss["bc_note"] = "", 0.0, ""
+
+
+def cb_bc_modifie(bid):
+    ss = st.session_state
+    bcs = charge_bc()
+    bc = next((b for b in bcs if b["id"] == bid), None)
+    if bc is None:
+        msg("error", "Bon de commande introuvable.")
+        return
+    ref = (ss.get(f"bce_ref_{bid}") or "").strip()
+    montant = float(ss.get(f"bce_montant_{bid}") or 0)
+    periode = bool(ss.get(f"bce_periode_{bid}"))
+    d1, d2 = ((ss.get(f"bce_d1_{bid}"), ss.get(f"bce_d2_{bid}")) if periode else (None, None))
+    erreur = _bc_valide(ref, bc["client"], montant, periode, d1, d2, bcs, ignorer_id=bid)
+    if erreur:
+        msg("error", erreur)
+        return
+    bc.update({"ref": ref, "montant": montant, "date_debut": date_iso(d1), "date_fin": date_iso(d2),
+               "clos": bool(ss.get(f"bce_clos_{bid}")), "note": (ss.get(f"bce_note_{bid}") or "").strip()})
+    sauve_bc(bcs)
+    msg("success", f"Bon de commande « {ref} » mis à jour.")
+
+
+def cb_bc_supprime(bid):
+    bcs = charge_bc()
+    reste = [b for b in bcs if b["id"] != bid]
+    sauve_bc(reste)
+    msg("success", "Bon de commande supprimé." if len(reste) < len(bcs) else "Bon introuvable.")
+
+
+def _fr(iso):
+    return f"{iso[8:10]}/{iso[5:7]}/{iso[0:4]}"
+
+
+def calcule_situation(base, bcs, seuil):
+    """Compare le montant livré (HT net) de chaque bon de commande à son montant."""
+    colonnes = ["id", "Référence BC", "Client", "Chantier", "Période", "Montant BC (HT net)",
+                "Livré (HT net)", "Reste", "Dépassement", "% consommé", "Statut", "Qté livrée"]
+    lignes = []
+    for bc in bcs:
+        sub = base[base["Client"] == bc["client"]]
+        if bc.get("chantier") and "Chantier" in sub.columns:
+            sub = sub[sub["Chantier"] == bc["chantier"]]
+        if bc.get("date_debut"):
+            sub = sub[sub["Jour"] >= bc["date_debut"]]
+        if bc.get("date_fin"):
+            sub = sub[sub["Jour"] <= bc["date_fin"]]
+        livre = float(sub["Montant HT Net"].sum())
+        montant = float(bc["montant"])
+        pct = livre / montant * 100 if montant > 0 else 0.0
+        if bc.get("clos"):
+            statut = STATUT_CLOS
+        elif livre > montant:
+            statut = STATUT_DEPASSE
+        elif pct >= seuil:
+            statut = STATUT_PROCHE
+        else:
+            statut = STATUT_OK
+        d1, d2 = bc.get("date_debut"), bc.get("date_fin")
+        periode = ("toute la période" if not (d1 or d2) else
+                   f"{_fr(d1) if d1 else '…'} → {_fr(d2) if d2 else '…'}")
+        lignes.append({"id": bc["id"], "Référence BC": bc["ref"], "Client": bc["client"],
+                       "Chantier": bc.get("chantier") or "(tous)", "Période": periode,
+                       "Montant BC (HT net)": montant, "Livré (HT net)": livre,
+                       "Reste": max(montant - livre, 0.0), "Dépassement": max(livre - montant, 0.0),
+                       "% consommé": round(pct, 1), "Statut": statut,
+                       "Qté livrée": float(sub["Quantité"].sum()) if "Quantité" in sub.columns else None})
+    return pd.DataFrame(lignes, columns=colonnes)
 
 
 # =====================================================================
@@ -614,7 +770,7 @@ if est_admin:
             st.session_state["cle"] += 1
             st.rerun()
 
-    with st.expander("💾 Sauvegarde et restauration de tous les fichiers"):
+    with st.expander("💾 Sauvegarde et restauration (fichiers + bons de commande)"):
         st.caption("Les fichiers sont stockés sur le serveur : ils peuvent disparaître au "
                    "redémarrage de l'application. Téléchargez une sauvegarde régulièrement ; "
                    "elle contient aussi la carrière de chaque fichier.")
@@ -628,8 +784,9 @@ if est_admin:
                                  key=f"zip_{cle}")
         if zipup is not None and st.button("Restaurer la sauvegarde"):
             try:
-                nb, ign = restaure_zip(zipup.getvalue())
+                nb, ign, nbc = restaure_zip(zipup.getvalue())
                 msg("success", f"{nb} fichier(s) restauré(s)"
+                               + (f", {nbc} bon(s) de commande" if nbc else "")
                                + (f", {ign} déjà présent(s) ignoré(s)." if ign else "."))
             except Exception:
                 msg("error", "Sauvegarde invalide.")
@@ -881,6 +1038,22 @@ def fmt(x):
     return f"{x:,.2f}".replace(",", " ")
 
 
+# ---------- Bons de commande : situation et alertes ----------
+bcs = charge_bc()
+seuil_alerte = int(st.session_state.get("bc_seuil", 80))
+sit = calcule_situation(df, bcs, seuil_alerte)
+if not sit.empty:
+    depasses = sit[sit["Statut"] == STATUT_DEPASSE]
+    proches = sit[sit["Statut"] == STATUT_PROCHE]
+    if len(depasses):
+        st.error("🔴 **Bon(s) de commande dépassé(s)** : " + " · ".join(
+            f"{r['Référence BC']} ({r['Client']}) +{fmt(r['Dépassement'])} Dh"
+            for _, r in depasses.iterrows()))
+    if len(proches):
+        st.warning(f"🟠 **Proche(s) du plafond (≥ {seuil_alerte} %)** : " + " · ".join(
+            f"{r['Référence BC']} ({r['Client']}) {r['% consommé']:.0f} %"
+            for _, r in proches.iterrows()))
+
 # ---------- Indicateurs ----------
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Montant HT Net total", fmt(f["Montant HT Net"].sum()))
@@ -924,6 +1097,7 @@ def afficher(cle, croise=None):
 noms_onglets = ["📅 Par mois", "📆 Par jour", "🏭 Par carrière", "👥 Par client", "🪨 Par produit"]
 if c_chantier:
     noms_onglets.append("🏗️ Par chantier")
+noms_onglets.append("📑 Bons de commande")
 noms_onglets.append("📋 Détail")
 onglets = dict(zip(noms_onglets, st.tabs(noms_onglets)))
 
@@ -944,6 +1118,83 @@ with onglets["🪨 Par produit"]:
 if c_chantier:
     with onglets["🏗️ Par chantier"]:
         afficher("Chantier", "Mois")
+with onglets["📑 Bons de commande"]:
+    st.caption("Pour chaque bon de commande, le montant livré (Montant HT Net des livraisons du "
+               "client, toutes carrières confondues) est comparé au montant NET HT du bon.")
+    st.number_input("Seuil d'alerte (% du bon déjà consommé)", min_value=10, max_value=100,
+                    value=80, step=5, key="bc_seuil")
+    if sit.empty:
+        st.info("Aucun bon de commande enregistré." + (" Ajoutez-en un ci-dessous." if est_admin else ""))
+    else:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Bons actifs", int((sit["Statut"] != STATUT_CLOS).sum()))
+        m2.metric("🔴 Dépassés", int((sit["Statut"] == STATUT_DEPASSE).sum()))
+        m3.metric("🟠 Proches du plafond", int((sit["Statut"] == STATUT_PROCHE).sum()))
+        m4.metric("Dépassement total (Dh)", fmt(sit.loc[sit["Statut"] != STATUT_CLOS, "Dépassement"].sum()))
+        aff = sit.drop(columns=["id"]).sort_values("% consommé", ascending=False)
+        if not c_qte:
+            aff = aff.drop(columns=["Qté livrée"])
+        st.dataframe(aff, use_container_width=True, hide_index=True, column_config={
+            "Montant BC (HT net)": st.column_config.NumberColumn(format="%.2f"),
+            "Livré (HT net)": st.column_config.NumberColumn(format="%.2f"),
+            "Reste": st.column_config.NumberColumn(format="%.2f"),
+            "Dépassement": st.column_config.NumberColumn(format="%.2f"),
+            "% consommé": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f%%"),
+        })
+
+    if est_admin:
+        with st.expander("➕ Ajouter un bon de commande", expanded=sit.empty):
+            clients_liste = sorted(df["Client"].unique(), key=str)
+            a1, a2 = st.columns(2)
+            a1.text_input("Référence du bon de commande client", key="bc_ref",
+                          placeholder="ex. BC-2026-0145")
+            client_bc = a2.selectbox("Client", clients_liste, key="bc_client")
+            a3, a4 = st.columns(2)
+            a3.number_input("Montant NET HT du bon de commande (Dh)", min_value=0.0, step=1000.0,
+                            format="%.2f", key="bc_montant")
+            if c_chantier:
+                chs = sorted(df.loc[df["Client"] == client_bc, "Chantier"].unique(), key=str)
+                a4.selectbox("Chantier (optionnel)", [TOUS] + chs, key=f"bc_chantier_{client_bc}")
+            st.checkbox("Limiter à une période (optionnel)", key="bc_periode")
+            if st.session_state.get("bc_periode"):
+                p1, p2 = st.columns(2)
+                p1.date_input("Du", key="bc_d1")
+                p2.date_input("Au", key="bc_d2")
+            st.text_input("Note (optionnel)", key="bc_note")
+            st.button("Enregistrer le bon de commande", type="primary", on_click=cb_bc_ajoute)
+
+        if bcs:
+            with st.expander("✏️ Modifier ou supprimer un bon de commande"):
+                etiquettes = {b["id"]: f"{b['ref']} · {b['client']}" for b in bcs}
+                bid = st.selectbox("Bon de commande", list(etiquettes), format_func=etiquettes.get,
+                                   key="bc_sel")
+                bc = next(b for b in bcs if b["id"] == bid)
+                st.text_input("Référence", value=bc["ref"], key=f"bce_ref_{bid}")
+                st.number_input("Montant NET HT (Dh)", min_value=0.0, step=1000.0, format="%.2f",
+                                value=float(bc["montant"]), key=f"bce_montant_{bid}")
+                st.checkbox("Clôturé (plus d'alerte pour ce bon)", value=bool(bc.get("clos")),
+                            key=f"bce_clos_{bid}")
+                a_periode = st.checkbox("Limiter à une période",
+                                        value=bool(bc.get("date_debut") or bc.get("date_fin")),
+                                        key=f"bce_periode_{bid}")
+                if a_periode:
+                    aujourdhui = datetime.today().date()
+                    q1, q2 = st.columns(2)
+                    q1.date_input("Du", key=f"bce_d1_{bid}", value=(
+                        datetime.strptime(bc["date_debut"], "%Y-%m-%d").date()
+                        if bc.get("date_debut") else aujourdhui))
+                    q2.date_input("Au", key=f"bce_d2_{bid}", value=(
+                        datetime.strptime(bc["date_fin"], "%Y-%m-%d").date()
+                        if bc.get("date_fin") else aujourdhui))
+                st.text_input("Note", value=bc.get("note", ""), key=f"bce_note_{bid}")
+                s1, s2 = st.columns(2)
+                s1.button("Enregistrer les modifications", type="primary",
+                          on_click=cb_bc_modifie, args=(bid,))
+                with s2.popover("🗑️ Supprimer ce bon"):
+                    st.write(f"Supprimer **{bc['ref']}** ?")
+                    st.button("Oui, supprimer", key=f"bc_del_{bid}", on_click=cb_bc_supprime,
+                              args=(bid,))
+
 with onglets["📋 Détail"]:
     st.dataframe(f, use_container_width=True)
 
