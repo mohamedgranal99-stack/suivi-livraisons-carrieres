@@ -6,6 +6,7 @@ import os
 import re
 import secrets as pysecrets
 import time
+import zipfile
 from datetime import datetime
 
 import pandas as pd
@@ -343,6 +344,113 @@ def lire_classeur(chemin, mtime):
     return res
 
 
+# ---------- Carrières (BS1, BS2, BS3, TG, KM, BA) ----------
+CARRIERES = ["BS1", "BS2", "BS3", "TG", "KM", "BA"]
+NON_CLASSEE = "Non classée"
+FICHIER_META = os.path.join(DOSSIER, "carrieres.json")   # {nom_fichier: {carriere, ajoute}}
+
+
+def charge_meta():
+    try:
+        with open(FICHIER_META, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def sauve_meta(d):
+    tmp = FICHIER_META + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(d, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, FICHIER_META)
+
+
+def detecte_carriere(nom):
+    """Devine la carrière d'après le nom du fichier (None si absente ou ambiguë)."""
+    n = nom.upper()
+    trouvees = {"BS" + m.group(1)
+                for m in re.finditer(r"(?<![A-Z0-9])BS\s*[-_.]?\s*([123])(?![0-9])", n)}
+    for code in ("TG", "KM", "BA"):
+        if re.search(rf"(?<![A-Z0-9]){code}(?![A-Z0-9])", n):
+            trouvees.add(code)
+    return next(iter(trouvees)) if len(trouvees) == 1 else None
+
+
+def carriere_de(nom, meta=None):
+    meta = charge_meta() if meta is None else meta
+    c = (meta.get(nom) or {}).get("carriere")
+    if c in CARRIERES:
+        return c
+    return detecte_carriere(nom) or NON_CLASSEE
+
+
+def date_ajout(nom, meta=None):
+    """Date d'enregistrement du fichier (sert à savoir quel fichier est le plus récent)."""
+    meta = charge_meta() if meta is None else meta
+    try:
+        return float(meta[nom]["ajoute"])
+    except Exception:
+        try:
+            return os.path.getmtime(os.path.join(DOSSIER, nom))
+        except OSError:
+            return 0.0
+
+
+def cb_carriere(nom, cle_widget):
+    v = st.session_state.get(cle_widget)
+    m = charge_meta()
+    if nom not in m:
+        m[nom] = {"ajoute": date_ajout(nom, m)}
+    m[nom]["carriere"] = v if v in CARRIERES else NON_CLASSEE
+    sauve_meta(m)
+
+
+def sauvegarde_zip():
+    buf = io.BytesIO()
+    meta = charge_meta()
+    noms = liste_fichiers()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for nom in noms:
+            z.write(os.path.join(DOSSIER, nom), arcname=nom)
+        z.writestr("carrieres.json", json.dumps(
+            {n: {"carriere": carriere_de(n, meta), "ajoute": date_ajout(n, meta)} for n in noms},
+            ensure_ascii=False, indent=2))
+    return buf.getvalue()
+
+
+def restaure_zip(contenu):
+    """Restaure les fichiers d'une sauvegarde ZIP (ceux déjà présents sont conservés)."""
+    nb, ignores = 0, 0
+    m = charge_meta()
+    existants = set(liste_fichiers())
+    with zipfile.ZipFile(io.BytesIO(contenu)) as z:
+        try:
+            info = json.loads(z.read("carrieres.json").decode("utf-8"))
+        except Exception:
+            info = {}
+        for nom_zip in z.namelist():
+            nom = nom_sur(nom_zip)
+            if nom_zip.endswith("/") or not nom.lower().endswith(EXT):
+                continue
+            if nom in existants:
+                ignores += 1
+                continue
+            with open(os.path.join(DOSSIER, nom), "wb") as fh:
+                fh.write(z.read(nom_zip))
+            mi = info.get(nom) or {}
+            car = mi.get("carriere")
+            try:
+                ajoute = float(mi.get("ajoute"))
+            except (TypeError, ValueError):
+                ajoute = time.time()
+            m[nom] = {"carriere": car if car in CARRIERES else (detecte_carriere(nom) or NON_CLASSEE),
+                      "ajoute": ajoute}
+            nb += 1
+    sauve_meta(m)
+    return nb, ignores
+
+
 # =====================================================================
 # 1) GESTION DES FICHIERS ENREGISTRÉS
 # =====================================================================
@@ -417,17 +525,24 @@ fichiers = liste_fichiers()
 
 if est_admin:
     st.subheader("📁 Fichiers enregistrés sur la plateforme")
+    meta = charge_meta()
+    options_car = CARRIERES + [NON_CLASSEE]
 
     if fichiers:
-        for i, nom in enumerate(fichiers):
+        classes = sorted(fichiers, key=lambda x: (carriere_de(x, meta), x))
+        for i, nom in enumerate(classes):
             chemin = os.path.join(DOSSIER, nom)
-            c1, c2, c3, c4 = st.columns([5, 1.7, 1.8, 1.8])
+            c1, c2, c3, c4, c5 = st.columns([4.2, 1.5, 1.6, 1.7, 1.7])
             c1.markdown(f"**📄 {nom}**  \n<small>{info_fichier(chemin)}</small>",
                         unsafe_allow_html=True)
+            actuelle = carriere_de(nom, meta)
+            c2.selectbox("Carrière", options_car, index=options_car.index(actuelle),
+                         key=f"car_{i}_{nom}", label_visibility="collapsed",
+                         on_change=cb_carriere, args=(nom, f"car_{i}_{nom}"))
             with open(chemin, "rb") as fh:
-                c2.download_button("⬇️ Télécharger", fh.read(), file_name=nom, key=f"dl_{i}")
+                c3.download_button("⬇️ Télécharger", fh.read(), file_name=nom, key=f"dl_{i}")
 
-            with c3.popover("✏️ Remplacer"):
+            with c4.popover("✏️ Remplacer"):
                 nouveau = st.file_uploader("Nouveau fichier Excel", type=TYPES, key=f"rep_{i}_{cle}")
                 if nouveau is not None and st.button("Confirmer le remplacement", key=f"okrep_{i}"):
                     nouveau_nom = nom_sur(nouveau.name)
@@ -438,30 +553,52 @@ if est_admin:
                             fh.write(nouveau.getvalue())
                         if nouveau_nom != nom:
                             os.remove(chemin)
+                        m = charge_meta()
+                        car = carriere_de(nom, m)
+                        if car == NON_CLASSEE:
+                            car = detecte_carriere(nouveau_nom) or NON_CLASSEE
+                        m.pop(nom, None)
+                        m[nouveau_nom] = {"carriere": car, "ajoute": time.time()}
+                        sauve_meta(m)
                         msg("success", f"« {nom} » a été remplacé par « {nouveau_nom} ».")
                         st.session_state["cle"] += 1
                         st.rerun()
 
-            with c4.popover("🗑️ Supprimer"):
+            with c5.popover("🗑️ Supprimer"):
                 st.write(f"Supprimer **{nom}** ?")
                 if st.button("Oui, supprimer", key=f"del_{i}"):
                     os.remove(chemin)
+                    m = charge_meta()
+                    m.pop(nom, None)
+                    sauve_meta(m)
                     msg("success", f"« {nom} » a été supprimé.")
                     st.session_state["cle"] += 1
                     st.rerun()
     else:
-        st.info("Aucun fichier enregistré. Ajoutez votre fichier Excel ci-dessous.")
+        st.info("Aucun fichier enregistré. Ajoutez vos fichiers Excel ci-dessous.")
 
     with st.expander("➕ Ajouter des fichiers", expanded=not fichiers):
-        ajouts = st.file_uploader("Fichier(s) Excel de suivi", type=TYPES,
-                                  accept_multiple_files=True, key=f"add_{cle}")
+        ajouts = st.file_uploader("Fichier(s) Excel de suivi (une ou plusieurs carrières)",
+                                  type=TYPES, accept_multiple_files=True, key=f"add_{cle}")
+        choix_car = {}
+        if ajouts:
+            st.markdown("**Carrière de chaque fichier** (détectée d'après le nom, à corriger si besoin) :")
+            opts = ["— choisir —"] + CARRIERES
+            for j, up in enumerate(ajouts):
+                det = detecte_carriere(up.name)
+                choix_car[j] = st.selectbox(up.name, opts, index=opts.index(det) if det else 0,
+                                            key=f"carAdd_{cle}_{j}")
         if ajouts and st.button("💾 Enregistrer sur la plateforme", type="primary"):
             existants = {empreinte_fichier(os.path.join(DOSSIER, f)): f for f in liste_fichiers()}
-            for up in ajouts:
+            m = charge_meta()
+            for j, up in enumerate(ajouts):
+                car = choix_car.get(j)
                 contenu = up.getvalue()
                 nom_up = nom_sur(up.name)
                 h = empreinte_octets(contenu)
-                if h in existants:
+                if car not in CARRIERES:
+                    msg("warning", f"« {up.name} » : choisissez sa carrière. Fichier non enregistré.")
+                elif h in existants:
                     msg("warning", f"« {up.name} » est identique à « {existants[h]} » déjà "
                                    f"enregistré : ignoré (pas de doublon).")
                 elif nom_up in existants.values():
@@ -470,8 +607,33 @@ if est_admin:
                 else:
                     with open(os.path.join(DOSSIER, nom_up), "wb") as fh:
                         fh.write(contenu)
+                    m[nom_up] = {"carriere": car, "ajoute": time.time()}
                     existants[h] = nom_up
-                    msg("success", f"« {nom_up} » enregistré.")
+                    msg("success", f"« {nom_up} » enregistré ({car}).")
+            sauve_meta(m)
+            st.session_state["cle"] += 1
+            st.rerun()
+
+    with st.expander("💾 Sauvegarde et restauration de tous les fichiers"):
+        st.caption("Les fichiers sont stockés sur le serveur : ils peuvent disparaître au "
+                   "redémarrage de l'application. Téléchargez une sauvegarde régulièrement ; "
+                   "elle contient aussi la carrière de chaque fichier.")
+        if fichiers and st.button("📦 Préparer la sauvegarde (ZIP)"):
+            st.session_state["zip_pret"] = sauvegarde_zip()
+        if st.session_state.get("zip_pret"):
+            st.download_button("⬇️ Télécharger la sauvegarde", st.session_state["zip_pret"],
+                               file_name=f"sauvegarde_livraisons_{datetime.now():%Y-%m-%d}.zip",
+                               mime="application/zip")
+        zipup = st.file_uploader("Restaurer depuis une sauvegarde (ZIP)", type=["zip"],
+                                 key=f"zip_{cle}")
+        if zipup is not None and st.button("Restaurer la sauvegarde"):
+            try:
+                nb, ign = restaure_zip(zipup.getvalue())
+                msg("success", f"{nb} fichier(s) restauré(s)"
+                               + (f", {ign} déjà présent(s) ignoré(s)." if ign else "."))
+            except Exception:
+                msg("error", "Sauvegarde invalide.")
+            st.session_state["zip_pret"] = None
             st.session_state["cle"] += 1
             st.rerun()
 
@@ -485,7 +647,14 @@ st.divider()
 # =====================================================================
 # 2) CHOIX DES FICHIERS / FEUILLES À ANALYSER
 # =====================================================================
-sel_fichiers = st.sidebar.multiselect("Fichiers à analyser", fichiers, default=fichiers)
+avance = st.sidebar.expander("⚙️ Fichiers et feuilles utilisés (avancé)")
+sel_fichiers = avance.multiselect("Fichiers à analyser", fichiers, default=fichiers)
+remplacer = avance.checkbox(
+    "Un fichier plus récent remplace les mêmes jours (même carrière)", value=True,
+    help="Pour une carrière, si un jour apparaît dans plusieurs fichiers (ex. rapport cumulé "
+         "mis à jour chaque jour), seul le fichier enregistré en dernier est compté pour ce "
+         "jour : pas de double comptage.")
+meta_all = charge_meta()
 if not sel_fichiers:
     st.warning("Sélectionnez au moins un fichier dans la barre latérale.")
     st.stop()
@@ -507,7 +676,7 @@ for fch in sel_fichiers:
         elif any(m in feuille.lower() for m in MOTS_RECAP):
             ignorees.append(f"{label} (récapitulatif)")
         else:
-            h = empreinte_df(d)
+            h = (carriere_de(fch, meta_all), empreinte_df(d))   # identique = même carrière + même contenu
             if h in vus:
                 ignorees.append(f"{label} (identique à « {vus[h]} »)")
             else:
@@ -517,7 +686,7 @@ for fch in sel_fichiers:
 if not feuilles:
     st.stop()
 
-choisies = st.sidebar.multiselect("Feuilles incluses dans le calcul", list(feuilles), default=defaut)
+choisies = avance.multiselect("Feuilles incluses dans le calcul", list(feuilles), default=defaut)
 if ignorees:
     with st.sidebar.expander(f"⚠️ {len(ignorees)} feuille(s) ignorée(s) par défaut"):
         st.caption("Récapitulatifs, feuilles vides ou identiques à une autre feuille : "
@@ -528,9 +697,10 @@ if not choisies:
     st.warning("Sélectionnez au moins une feuille.")
     st.stop()
 
-df = pd.concat([feuilles[l][2].assign(Fichier=feuilles[l][0], Feuille=feuilles[l][1])
+df = pd.concat([feuilles[l][2].assign(Fichier=feuilles[l][0], Feuille=feuilles[l][1],
+                                      **{"Carrière": carriere_de(feuilles[l][0], meta_all)})
                 for l in choisies], ignore_index=True)
-cols = [c for c in df.columns if c not in ("Fichier", "Feuille")]
+cols = [c for c in df.columns if c not in ("Fichier", "Feuille", "Carrière")]
 
 
 # ---------- Détection automatique des colonnes (silencieuse) ----------
@@ -606,13 +776,23 @@ valide = d.notna()
 sans_date = df.loc[~valide].copy()
 df = df.loc[valide].copy()
 df["Mois"] = d.loc[valide].dt.strftime("%Y-%m")
+df["Jour"] = d.loc[valide].dt.strftime("%Y-%m-%d")
+
+# ---------- Consolidation : le fichier le plus récent remplace les mêmes jours d'une même carrière ----------
+n_remplacees = 0
+if remplacer and len(sel_fichiers) > 1:
+    ordre = sorted(sel_fichiers, key=lambda x: (date_ajout(x, meta_all), x))
+    df["_rang"] = df["Fichier"].map({fch: i for i, fch in enumerate(ordre)})
+    dernier = df.groupby(["Carrière", "Jour"])["_rang"].transform("max")
+    n_remplacees = int((df["_rang"] != dernier).sum())
+    df = df[df["_rang"] == dernier].drop(columns="_rang")
 
 if df.empty:
     st.warning("Aucune ligne exploitable après nettoyage. Vérifiez le fichier.")
     st.stop()
 
 # ---------- Lignes en double ----------
-colonnes_source = [c for c in cols if c in df.columns]
+colonnes_source = [c for c in cols if c in df.columns] + ["Carrière"]
 n_dup = int(df.duplicated(subset=colonnes_source).sum())
 retirer = False
 if n_dup:
@@ -624,12 +804,15 @@ if retirer:
     df = df.drop_duplicates(subset=colonnes_source)
 
 # ---------- Vérification des totaux ----------
-with st.expander("🔎 Vérification des totaux par fichier, feuille et mois"):
+with st.expander("🔎 Vérification des totaux par carrière, fichier, feuille et mois"):
     agg = {"Lignes": ("Montant HT Net", "size"), "Montant_HT_Net": ("Montant HT Net", "sum")}
     if c_qte:
         agg["Quantité"] = ("Quantité", "sum")
-    verif = df.groupby(["Fichier", "Feuille", "Mois"]).agg(**agg).reset_index()
+    verif = df.groupby(["Carrière", "Fichier", "Feuille", "Mois"]).agg(**agg).reset_index()
     st.dataframe(verif, use_container_width=True)
+    if n_remplacees:
+        st.info(f"{n_remplacees} ligne(s) ignorée(s) car un fichier plus récent de la même "
+                f"carrière couvre les mêmes jours.")
     if len(sans_date):
         st.warning(f"{len(sans_date)} ligne(s) sans date valide ont été exclues du calcul "
                    f"(souvent la ligne de total du bas de la feuille) :")
@@ -640,7 +823,8 @@ with st.expander("🔎 Vérification des totaux par fichier, feuille et mois"):
                "Montant HT Net dans votre Excel.")
 
 # ---------- Filtres (liés entre eux) ----------
-FILTRES = {"f_mois": "Mois", "f_client": c_client, "f_produit": c_produit}
+FILTRES = {"f_carriere": "Carrière", "f_mois": "Mois", "f_client": c_client,
+           "f_produit": c_produit}
 if c_chantier:
     FILTRES["f_chantier"] = "Chantier"
 
@@ -669,6 +853,7 @@ def cb_reset_filtres():
 
 st.sidebar.subheader("Filtres")
 st.sidebar.button("↺ Réinitialiser les filtres", on_click=cb_reset_filtres)
+carrieres = st.sidebar.multiselect("Carrière", options_possibles("f_carriere"), key="f_carriere")
 mois = st.sidebar.multiselect("Mois", options_possibles("f_mois"), key="f_mois")
 clients = st.sidebar.multiselect("Client", options_possibles("f_client"), key="f_client")
 produits = st.sidebar.multiselect("Produit", options_possibles("f_produit"), key="f_produit")
@@ -679,6 +864,8 @@ mn, mx = float(df["Montant HT Net"].min()), float(df["Montant HT Net"].max())
 plage = st.sidebar.slider("Montant HT Net (par ligne)", mn, mx, (mn, mx)) if mn < mx else (mn, mx)
 
 f = df.copy()
+if carrieres:
+    f = f[f["Carrière"].isin(carrieres)]
 if mois:
     f = f[f["Mois"].isin(mois)]
 if clients:
@@ -722,7 +909,7 @@ def resume(cle):
 
 def afficher(cle, croise=None):
     r = resume(cle)
-    r = r.sort_values("Mois") if cle == "Mois" else r.sort_values(ind, ascending=False)
+    r = r.sort_values(cle) if cle in ("Mois", "Jour") else r.sort_values(ind, ascending=False)
     st.bar_chart(r, x=cle, y=ind)
     total = {cle: "TOTAL", **{c: r[c].sum() for c in r.columns if c != cle}}
     st.dataframe(pd.concat([r, pd.DataFrame([total])], ignore_index=True),
@@ -734,22 +921,30 @@ def afficher(cle, croise=None):
                      use_container_width=True)
 
 
-noms_onglets = ["📅 Par mois", "👥 Par client", "🪨 Par produit"]
+noms_onglets = ["📅 Par mois", "📆 Par jour", "🏭 Par carrière", "👥 Par client", "🪨 Par produit"]
 if c_chantier:
     noms_onglets.append("🏗️ Par chantier")
 noms_onglets.append("📋 Détail")
-onglets = st.tabs(noms_onglets)
+onglets = dict(zip(noms_onglets, st.tabs(noms_onglets)))
 
-with onglets[0]:
+with onglets["📅 Par mois"]:
     afficher("Mois")
-with onglets[1]:
+with onglets["📆 Par jour"]:
+    afficher("Jour")
+with onglets["🏭 Par carrière"]:
+    afficher("Carrière", "Mois")
+    st.markdown("**Dernier jour reçu par carrière**")
+    dern = (f.groupby("Carrière").agg(Dernier_jour=("Jour", "max"), Jours_renseignés=("Jour", "nunique"))
+            .reset_index())
+    st.dataframe(dern, use_container_width=True, hide_index=True)
+with onglets["👥 Par client"]:
     afficher(c_client, "Mois")
-with onglets[2]:
+with onglets["🪨 Par produit"]:
     afficher(c_produit, "Client")
 if c_chantier:
-    with onglets[3]:
+    with onglets["🏗️ Par chantier"]:
         afficher("Chantier", "Mois")
-with onglets[-1]:
+with onglets["📋 Détail"]:
     st.dataframe(f, use_container_width=True)
 
 # ---------- Export ----------
