@@ -1,8 +1,10 @@
 import hashlib
 import hmac
 import io
+import json
 import os
 import re
+import secrets as pysecrets
 import time
 from datetime import datetime
 
@@ -26,21 +28,28 @@ MOTS_RECAP = ["recap", "récap", "total", "cumul", "synth", "bilan", "global"]
 st.session_state.setdefault("cle", 0)
 
 # =====================================================================
-# AUTHENTIFICATION (comptes stockés dans les « Secrets » de Streamlit)
+# AUTHENTIFICATION ET COMPTES UTILISATEURS
+#   - compte « de secours » permanent : défini dans les Secrets de Streamlit
+#   - autres comptes : créés / modifiés / supprimés par l'administrateur dans l'application
 # =====================================================================
 ITERATIONS = 200_000
 MAX_TENTATIVES = 5
+DOSSIER_COMPTES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "comptes_utilisateurs")
+os.makedirs(DOSSIER_COMPTES, exist_ok=True)
+FICHIER_COMPTES = os.path.join(DOSSIER_COMPTES, "utilisateurs.json")
+RE_LOGIN = re.compile(r"^[a-z0-9_.-]{3,30}$")
+ROLES = {"user": "Utilisateur", "admin": "Administrateur"}
+ALPHABET = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
 EXEMPLE_SECRETS = """[users.admin]
 name = "Administrateur"
 role = "admin"
 password_hash = "COLLER_ICI_LE_HASH"
-
-[users.ahmed]
-name = "Ahmed"
-role = "user"
-password_hash = "COLLER_ICI_LE_HASH"
 """
+
+
+def msg(typ, texte):
+    st.session_state.setdefault("msgs", []).append((typ, texte))
 
 
 def hash_mdp(mdp):
@@ -58,11 +67,39 @@ def verifie_mdp(mdp, stocke):
         return False
 
 
-def charge_utilisateurs():
+def comptes_fichier():
+    try:
+        with open(FICHIER_COMPTES, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def sauve_comptes(d):
+    tmp = FICHIER_COMPTES + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(d, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, FICHIER_COMPTES)
+
+
+def comptes_secrets():
     try:
         return {str(k).strip().lower(): dict(v) for k, v in st.secrets["users"].items()}
     except Exception:
         return {}
+
+
+def tous_comptes():
+    """Comptes de l'application + comptes des Secrets (ces derniers sont prioritaires)."""
+    c = {k: {**v, "source": "fichier"} for k, v in comptes_fichier().items()}
+    for k, v in comptes_secrets().items():
+        c[k] = {**v, "source": "secrets"}
+    return c
+
+
+def moi():
+    return (st.session_state.get("user") or {}).get("login")
 
 
 def bloc_generateur():
@@ -74,16 +111,107 @@ def bloc_generateur():
         st.caption("Copiez cette ligne dans les Secrets, sous l'utilisateur concerné.")
 
 
-def connexion():
-    if st.session_state.get("user"):
-        return st.session_state["user"]
+# ---------- Actions (appelées par les boutons) ----------
+def cb_genere():
+    st.session_state["nu_mdp"] = "".join(pysecrets.choice(ALPHABET) for _ in range(10))
 
-    users = charge_utilisateurs()
-    if not users:
+
+def cb_ajoute():
+    ss = st.session_state
+    login = ss.get("nu_login", "").strip().lower()
+    nom = ss.get("nu_nom", "").strip() or login
+    mdp = ss.get("nu_mdp", "")
+    role = ss.get("nu_role", "user")
+    if not RE_LOGIN.match(login):
+        msg("error", "Identifiant invalide : 3 à 30 caractères (lettres minuscules, chiffres, . _ -).")
+    elif login in tous_comptes():
+        msg("error", f"L'identifiant « {login} » existe déjà.")
+    elif len(mdp) < 8:
+        msg("error", "Mot de passe trop court (8 caractères minimum).")
+    else:
+        d = comptes_fichier()
+        d[login] = {"name": nom, "role": role, "password_hash": hash_mdp(mdp)}
+        sauve_comptes(d)
+        msg("success", f"Utilisateur créé. Communiquez-lui : identifiant « {login} » · "
+                       f"mot de passe « {mdp} ».")
+        for k in ("nu_login", "nu_nom", "nu_mdp"):
+            ss[k] = ""
+
+
+def cb_modifie(login):
+    ss = st.session_state
+    d = comptes_fichier()
+    if login not in d:
+        msg("error", "Compte introuvable.")
+        return
+    role = ss.get(f"ed_role_{login}", d[login].get("role", "user"))
+    nouveau = ss.get(f"ed_mdp_{login}", "")
+    if login == moi() and role != "admin":
+        msg("error", "Vous ne pouvez pas retirer votre propre rôle d'administrateur.")
+    elif nouveau and len(nouveau) < 8:
+        msg("error", "Mot de passe trop court (8 caractères minimum).")
+    else:
+        d[login]["name"] = ss.get(f"ed_nom_{login}", "").strip() or login
+        d[login]["role"] = role
+        texte = f"Compte « {login} » mis à jour."
+        if nouveau:
+            d[login]["password_hash"] = hash_mdp(nouveau)
+            texte += f" Nouveau mot de passe : « {nouveau} »."
+        sauve_comptes(d)
+        ss[f"ed_mdp_{login}"] = ""
+        msg("success", texte)
+
+
+def cb_supprime(login):
+    d = comptes_fichier()
+    if login == moi():
+        msg("error", "Vous ne pouvez pas supprimer votre propre compte.")
+    elif login in d:
+        del d[login]
+        sauve_comptes(d)
+        msg("success", f"Compte « {login} » supprimé.")
+
+
+def cb_mon_mdp():
+    ss = st.session_state
+    u = ss.get("user")
+    if not u:
+        return
+    d = comptes_fichier()
+    cur = d.get(u["login"])
+    new, new2 = ss.get("mm_new", ""), ss.get("mm_new2", "")
+    if u.get("source") == "secrets" or cur is None:
+        msg("warning", "Ce compte est permanent (Secrets) : son mot de passe se change là-bas.")
+    elif not verifie_mdp(ss.get("mm_old", ""), cur.get("password_hash", "")):
+        msg("error", "Mot de passe actuel incorrect.")
+    elif new != new2:
+        msg("error", "Les deux nouveaux mots de passe sont différents.")
+    elif len(new) < 8:
+        msg("error", "Nouveau mot de passe trop court (8 caractères minimum).")
+    else:
+        cur["password_hash"] = hash_mdp(new)
+        sauve_comptes(d)
+        msg("success", "Votre mot de passe a été changé.")
+        for k in ("mm_old", "mm_new", "mm_new2"):
+            ss[k] = ""
+
+
+def connexion():
+    comptes = tous_comptes()
+
+    if st.session_state.get("user"):
+        actuel = comptes.get(st.session_state["user"]["login"])
+        if actuel:   # le rôle / nom sont relus à chaque fois (compte modifié par l'admin)
+            return {**st.session_state["user"], "name": actuel.get("name", moi()),
+                    "role": actuel.get("role", "user")}
+        st.session_state.clear()   # compte supprimé : déconnexion
+        st.rerun()
+
+    if not comptes:
         st.warning("🔧 Configuration initiale : aucun utilisateur n'est défini.")
         st.markdown("1. Saisissez un mot de passe ci-dessous pour obtenir son **hash**.  \n"
                     "2. Dans Streamlit Cloud : **Manage app → Settings → Secrets**, collez le "
-                    "modèle suivant en remplaçant les hash.  \n"
+                    "modèle suivant en remplaçant le hash.  \n"
                     "3. Enregistrez, puis rechargez cette page.")
         bloc_generateur()
         st.code(EXEMPLE_SECRETS, language="toml")
@@ -100,12 +228,13 @@ def connexion():
         if n >= MAX_TENTATIVES:
             st.error("Trop de tentatives échouées. Rechargez la page et réessayez plus tard.")
             st.stop()
-        u = users.get(login.strip().lower())
+        cle_login = login.strip().lower()
+        u = comptes.get(cle_login)
         stocke = u.get("password_hash", "") if u else "x$1$00$00"   # même durée si inconnu
         if verifie_mdp(mdp, stocke) and u is not None:
-            st.session_state["user"] = {"login": login.strip().lower(),
-                                        "name": u.get("name", login.strip()),
-                                        "role": u.get("role", "user")}
+            st.session_state["user"] = {"login": cle_login, "name": u.get("name", cle_login),
+                                        "role": u.get("role", "user"),
+                                        "source": u.get("source", "fichier")}
             st.session_state["tentatives"] = 0
             st.rerun()
         st.session_state["tentatives"] = n + 1
@@ -117,16 +246,22 @@ def connexion():
 user = connexion()
 est_admin = user["role"] == "admin"
 st.sidebar.markdown(f"👤 **{user['name']}**  \n"
-                    f"<small>{'Administrateur' if est_admin else 'Utilisateur'}</small>",
+                    f"<small>{ROLES.get(user['role'], 'Utilisateur')}</small>",
                     unsafe_allow_html=True)
 if st.sidebar.button("🚪 Se déconnecter"):
     st.session_state.clear()
     st.rerun()
+with st.sidebar.expander("🔒 Changer mon mot de passe"):
+    if user.get("source") == "secrets":
+        st.caption("Compte permanent (Secrets) : le mot de passe se modifie dans les Secrets.")
+    else:
+        st.text_input("Mot de passe actuel", type="password", key="mm_old")
+        st.text_input("Nouveau mot de passe", type="password", key="mm_new")
+        st.text_input("Confirmer le nouveau", type="password", key="mm_new2")
+        st.button("Changer mon mot de passe", on_click=cb_mon_mdp)
 if est_admin:
-    with st.sidebar.expander("🔑 Générer un mot de passe haché"):
+    with st.sidebar.expander("🔑 Hash pour le compte de secours (Secrets)"):
         bloc_generateur()
-
-
 
 # ---------- Fonctions utilitaires ----------
 def nom_sur(nom):
@@ -156,10 +291,6 @@ def info_fichier(chemin):
     taille = f"{ko:,.0f} Ko".replace(",", " ")
     date = datetime.fromtimestamp(st_.st_mtime).strftime("%d/%m/%Y %H:%M")
     return f"{taille} · enregistré le {date}"
-
-
-def msg(typ, texte):
-    st.session_state.setdefault("msgs", []).append((typ, texte))
 
 
 def to_num(s):
@@ -213,8 +344,71 @@ def lire_classeur(chemin, mtime):
 for typ, texte in st.session_state.pop("msgs", []):
     getattr(st, typ)(texte)
 
-fichiers = liste_fichiers()
 cle = st.session_state["cle"]
+
+# ---------- Gestion des utilisateurs (administrateur) ----------
+if est_admin:
+    with st.expander("👥 Gestion des utilisateurs"):
+        comptes = tous_comptes()
+        for login, u in sorted(comptes.items()):
+            c1, c2, c3 = st.columns([5, 2, 2])
+            role_txt = ROLES.get(u.get("role", "user"), "Utilisateur")
+            badge = "  🔒 permanent (Secrets)" if u["source"] == "secrets" else ""
+            c1.markdown(f"**{u.get('name', login)}** · `{login}` · {role_txt}{badge}")
+            if u["source"] == "fichier":
+                with c2.popover("✏️ Modifier"):
+                    st.text_input("Nom affiché", value=u.get("name", login), key=f"ed_nom_{login}")
+                    st.selectbox("Rôle", list(ROLES), format_func=ROLES.get,
+                                 index=0 if u.get("role", "user") == "user" else 1,
+                                 key=f"ed_role_{login}")
+                    st.text_input("Nouveau mot de passe (vide = inchangé)", key=f"ed_mdp_{login}")
+                    st.button("Enregistrer", key=f"ed_ok_{login}", on_click=cb_modifie,
+                              args=(login,))
+                with c3.popover("🗑️ Supprimer"):
+                    st.write(f"Supprimer le compte **{login}** ?")
+                    st.button("Oui, supprimer", key=f"sup_{login}", on_click=cb_supprime,
+                              args=(login,))
+
+        st.markdown("**➕ Nouvel utilisateur**")
+        n1, n2 = st.columns(2)
+        n1.text_input("Nom affiché", key="nu_nom", placeholder="ex. Ahmed Alaoui")
+        n2.text_input("Identifiant (pour se connecter)", key="nu_login", placeholder="ex. ahmed")
+        m1, m2 = st.columns([3, 1])
+        m1.text_input("Mot de passe (8 caractères minimum)", key="nu_mdp")
+        m2.button("🎲 Générer", on_click=cb_genere)
+        st.selectbox("Rôle", list(ROLES), format_func=ROLES.get, key="nu_role")
+        st.button("Créer l'utilisateur", type="primary", on_click=cb_ajoute)
+
+        st.markdown("**💾 Sauvegarde des comptes**")
+        st.caption("Les comptes créés ici sont stockés sur le serveur : ils peuvent disparaître "
+                   "au redémarrage de l'application. Téléchargez une sauvegarde de temps en "
+                   "temps ; vous pourrez la restaurer en un clic.")
+        b1, b2 = st.columns(2)
+        b1.download_button("⬇️ Télécharger la sauvegarde",
+                           json.dumps(comptes_fichier(), ensure_ascii=False, indent=2),
+                           file_name="comptes_utilisateurs.json", mime="application/json")
+        sauv = b2.file_uploader("Restaurer une sauvegarde", type=["json"], key=f"restore_{cle}")
+        if sauv is not None and b2.button("Restaurer"):
+            try:
+                data = json.loads(sauv.getvalue().decode("utf-8"))
+                d = comptes_fichier()
+                nb = 0
+                for k, v in data.items():
+                    k = str(k).strip().lower()
+                    if (RE_LOGIN.match(k) and k not in comptes_secrets() and isinstance(v, dict)
+                            and str(v.get("password_hash", "")).startswith("pbkdf2_sha256$")):
+                        d[k] = {"name": v.get("name", k),
+                                "role": "admin" if v.get("role") == "admin" else "user",
+                                "password_hash": v["password_hash"]}
+                        nb += 1
+                sauve_comptes(d)
+                msg("success", f"{nb} compte(s) restauré(s).")
+            except Exception:
+                msg("error", "Fichier de sauvegarde invalide.")
+            st.session_state["cle"] += 1
+            st.rerun()
+
+fichiers = liste_fichiers()
 
 if est_admin:
     st.subheader("📁 Fichiers enregistrés sur la plateforme")
