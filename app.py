@@ -285,8 +285,11 @@ if c_qte:
 
 # ---------- Mois (à partir de la colonne date) ----------
 d = pd.to_datetime(df[c_date], errors="coerce", dayfirst=True)
-df["Mois"] = d.dt.to_period("M").astype(str)
-df = df[df["Mois"] != "NaT"]
+valide = d.notna()
+# lignes sans date valide (ex. ligne de TOTAL en bas de feuille) : exclues du calcul
+sans_date = df.loc[~valide].copy()
+df = df.loc[valide].copy()
+df["Mois"] = d.loc[valide].dt.strftime("%Y-%m")
 
 if df.empty:
     st.warning("Aucune ligne exploitable après nettoyage. Vérifiez le fichier.")
@@ -311,6 +314,10 @@ with st.expander("🔎 Vérification des totaux par fichier, feuille et mois"):
         agg["Quantité"] = ("Quantité", "sum")
     verif = df.groupby(["Fichier", "Feuille", "Mois"]).agg(**agg).reset_index()
     st.dataframe(verif, use_container_width=True)
+    if len(sans_date):
+        st.warning(f"{len(sans_date)} ligne(s) sans date valide ont été exclues du calcul "
+                   f"(souvent la ligne de total du bas de la feuille) :")
+        st.dataframe(sans_date, use_container_width=True)
     st.caption("Si un même mois apparaît dans deux fichiers (ex. août dans le fichier de "
                "septembre), ses livraisons sont comptées deux fois : retirez la feuille ou le "
                "fichier en trop. Comparez aussi chaque total avec la somme de la colonne "
