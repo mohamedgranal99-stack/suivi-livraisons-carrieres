@@ -703,50 +703,53 @@ if c_qte:
     k4.metric("Quantité totale", fmt(f["Quantité"].sum()))
 
 # ---------- Onglets ----------
+MONTANT = "Montant HT Net"
+QTE = "Quantité (m³)" if (c_qte and "m3" in c_qte.lower().replace("³", "3")) else "Quantité (T)"
+indicateurs = [MONTANT] + ([QTE] if c_qte else [])
+ind = (st.radio("Indicateur affiché dans les graphiques et tableaux croisés", indicateurs,
+                horizontal=True) if c_qte else MONTANT)
+col_ind = "Quantité" if ind == QTE else "Montant HT Net"
+
+
+def resume(cle):
+    """Montant HT Net, quantité et nombre de livraisons regroupés par `cle`."""
+    agg = {MONTANT: ("Montant HT Net", "sum")}
+    if c_qte:
+        agg[QTE] = ("Quantité", "sum")
+    agg["Livraisons"] = ("Montant HT Net", "size")
+    return f.groupby(cle, as_index=False).agg(**agg)
+
+
+def afficher(cle, croise=None):
+    r = resume(cle)
+    r = r.sort_values("Mois") if cle == "Mois" else r.sort_values(ind, ascending=False)
+    st.bar_chart(r, x=cle, y=ind)
+    total = {cle: "TOTAL", **{c: r[c].sum() for c in r.columns if c != cle}}
+    st.dataframe(pd.concat([r, pd.DataFrame([total])], ignore_index=True),
+                 use_container_width=True, hide_index=True)
+    if croise:
+        st.markdown(f"**{cle} × {croise} — {ind}**")
+        st.dataframe(f.pivot_table(index=cle, columns=croise, values=col_ind, aggfunc="sum",
+                                   fill_value=0, margins=True, margins_name="Total"),
+                     use_container_width=True)
+
+
 noms_onglets = ["📅 Par mois", "👥 Par client", "🪨 Par produit"]
 if c_chantier:
     noms_onglets.append("🏗️ Par chantier")
 noms_onglets.append("📋 Détail")
 onglets = st.tabs(noms_onglets)
-t1, t2, t3, t4 = onglets[0], onglets[1], onglets[2], onglets[-1]
 
-with t1:
-    m = f.groupby("Mois", as_index=False)["Montant HT Net"].sum()
-    st.bar_chart(m, x="Mois", y="Montant HT Net")
-    st.dataframe(m, use_container_width=True)
-
-with t2:
-    c = (f.groupby(c_client, as_index=False)["Montant HT Net"].sum()
-         .sort_values("Montant HT Net", ascending=False))
-    st.bar_chart(c, x=c_client, y="Montant HT Net")
-    st.dataframe(c, use_container_width=True)
-    st.markdown("**Client × Mois**")
-    st.dataframe(f.pivot_table(index=c_client, columns="Mois", values="Montant HT Net",
-                               aggfunc="sum", fill_value=0, margins=True, margins_name="Total"),
-                 use_container_width=True)
-
-with t3:
-    p = (f.groupby(c_produit, as_index=False)["Montant HT Net"].sum()
-         .sort_values("Montant HT Net", ascending=False))
-    st.bar_chart(p, x=c_produit, y="Montant HT Net")
-    st.dataframe(p, use_container_width=True)
-    st.markdown("**Produit × Client**")
-    st.dataframe(f.pivot_table(index=c_produit, columns=c_client, values="Montant HT Net",
-                               aggfunc="sum", fill_value=0, margins=True, margins_name="Total"),
-                 use_container_width=True)
-
+with onglets[0]:
+    afficher("Mois")
+with onglets[1]:
+    afficher(c_client, "Mois")
+with onglets[2]:
+    afficher(c_produit, "Client")
 if c_chantier:
     with onglets[3]:
-        h = (f.groupby("Chantier", as_index=False)["Montant HT Net"].sum()
-             .sort_values("Montant HT Net", ascending=False))
-        st.bar_chart(h, x="Chantier", y="Montant HT Net")
-        st.dataframe(h, use_container_width=True)
-        st.markdown("**Chantier × Mois**")
-        st.dataframe(f.pivot_table(index="Chantier", columns="Mois", values="Montant HT Net",
-                                   aggfunc="sum", fill_value=0, margins=True,
-                                   margins_name="Total"), use_container_width=True)
-
-with t4:
+        afficher("Chantier", "Mois")
+with onglets[-1]:
     st.dataframe(f, use_container_width=True)
 
 # ---------- Export ----------
