@@ -302,6 +302,11 @@ def to_num(s):
     return pd.to_numeric(s, errors="coerce")
 
 
+def texte_propre(serie):
+    """Texte sans espaces ; cellule vide -> chaîne vide."""
+    return serie.where(serie.notna(), "").astype(str).str.strip()
+
+
 def unique_cols(cols):
     vus, out = {}, []
     for c in cols:
@@ -554,6 +559,11 @@ c_qte = colonne("Quantité", ["qté en t", "qte en t", "tonnage", "quant", "qté
 c_pu = colonne("Prix unitaire", ["p.u ht", "p.u", "prix", "pu"])
 c_net = colonne("Montant HT Net", ["montant ht net", "ht net", "net ht", "montant ht",
                                    "total ht", "montant"])
+c_chantier = colonne("Chantier", ["chantier", "destination", "lieu"])
+if c_chantier is None:
+    with st.sidebar.expander("🏗️ Colonne Chantier (non détectée)"):
+        c_chantier = st.selectbox("Choisir la colonne Chantier", [None] + cols,
+                                  format_func=lambda x: "— aucune —" if x is None else x)
 
 if c_client is None or c_produit is None or c_date is None:
     st.warning("Certaines colonnes n'ont pas été détectées : choisissez-les dans la barre "
@@ -574,13 +584,17 @@ else:
 df["Montant HT Net"] = df["Montant HT Net"].fillna(0)
 
 # ---------- Nettoyage ----------
-df["Client"] = df[c_client].astype(str).str.strip()
-df["Produit"] = df[c_produit].astype(str).str.strip()
+df["Client"] = texte_propre(df[c_client])
+df["Produit"] = texte_propre(df[c_produit])
 c_client, c_produit = "Client", "Produit"
 df = df[~df[c_client].str.lower().isin(["", "nan", "none"])]
 masque_total = (df[c_client].str.lower().str.contains("total")
                 | df[c_produit].str.lower().str.contains("total"))
 df = df[~masque_total]
+
+if c_chantier:
+    ch = texte_propre(df[c_chantier])
+    df["Chantier"] = ch.where(~ch.str.lower().isin(["", "nan", "none", "nat"]), "(non renseigné)")
 
 if c_qte:
     df["Quantité"] = to_num(df[c_qte]).fillna(0)
@@ -630,6 +644,8 @@ st.sidebar.subheader("Filtres")
 mois = st.sidebar.multiselect("Mois", sorted(df["Mois"].astype(str).unique(), key=str))
 clients = st.sidebar.multiselect("Client", sorted(df[c_client].astype(str).unique(), key=str))
 produits = st.sidebar.multiselect("Produit", sorted(df[c_produit].astype(str).unique(), key=str))
+chantiers = (st.sidebar.multiselect("Chantier", sorted(df["Chantier"].unique(), key=str))
+             if c_chantier else [])
 
 mn, mx = float(df["Montant HT Net"].min()), float(df["Montant HT Net"].max())
 plage = st.sidebar.slider("Montant HT Net (par ligne)", mn, mx, (mn, mx)) if mn < mx else (mn, mx)
@@ -641,6 +657,8 @@ if clients:
     f = f[f[c_client].isin(clients)]
 if produits:
     f = f[f[c_produit].isin(produits)]
+if chantiers:
+    f = f[f["Chantier"].isin(chantiers)]
 f = f[f["Montant HT Net"].between(plage[0], plage[1])]
 
 
@@ -657,7 +675,12 @@ if c_qte:
     k4.metric("Quantité totale", fmt(f["Quantité"].sum()))
 
 # ---------- Onglets ----------
-t1, t2, t3, t4 = st.tabs(["📅 Par mois", "👥 Par client", "🪨 Par produit", "📋 Détail"])
+noms_onglets = ["📅 Par mois", "👥 Par client", "🪨 Par produit"]
+if c_chantier:
+    noms_onglets.append("🏗️ Par chantier")
+noms_onglets.append("📋 Détail")
+onglets = st.tabs(noms_onglets)
+t1, t2, t3, t4 = onglets[0], onglets[1], onglets[2], onglets[-1]
 
 with t1:
     m = f.groupby("Mois", as_index=False)["Montant HT Net"].sum()
@@ -683,6 +706,17 @@ with t3:
     st.dataframe(f.pivot_table(index=c_produit, columns=c_client, values="Montant HT Net",
                                aggfunc="sum", fill_value=0, margins=True, margins_name="Total"),
                  use_container_width=True)
+
+if c_chantier:
+    with onglets[3]:
+        h = (f.groupby("Chantier", as_index=False)["Montant HT Net"].sum()
+             .sort_values("Montant HT Net", ascending=False))
+        st.bar_chart(h, x="Chantier", y="Montant HT Net")
+        st.dataframe(h, use_container_width=True)
+        st.markdown("**Chantier × Mois**")
+        st.dataframe(f.pivot_table(index="Chantier", columns="Mois", values="Montant HT Net",
+                                   aggfunc="sum", fill_value=0, margins=True,
+                                   margins_name="Total"), use_container_width=True)
 
 with t4:
     st.dataframe(f, use_container_width=True)
