@@ -779,7 +779,7 @@ if est_admin:
         if fichiers and st.button("📦 Préparer la sauvegarde (ZIP)"):
             st.session_state["zip_pret"] = sauvegarde_zip()
         if st.session_state.get("zip_pret"):
-            st.download_button("⬇️️ Télécharger la sauvegarde", st.session_state["zip_pret"],
+            st.download_button("⬇ Télécharger la sauvegarde", st.session_state["zip_pret"],
                                file_name=f"sauvegarde_livraisons_{datetime.now():%Y-%m-%d}.zip",
                                mime="application/zip")
         zipup = st.file_uploader("Restaurer depuis une sauvegarde (ZIP)", type=["zip"],
@@ -1226,7 +1226,7 @@ with onglets["📋 Détail"]:
     st.dataframe(f, use_container_width=True)
 
 # =====================================================================
-# 3) EXPORT EXCEL COMPLET (CONFORME AUX TABLEAUX AFFICHÉS)
+# 3) EXPORT EXCEL COMPLET (CONFORME AUX TABLEAUX ET IMPRIMABLE EN A4 PAYSAGE)
 # =====================================================================
 buf = io.BytesIO()
 with pd.ExcelWriter(buf, engine="openpyxl") as w:
@@ -1267,6 +1267,17 @@ with pd.ExcelWriter(buf, engine="openpyxl") as w:
         alertes_exp = sit[sit["Statut"].isin([STATUT_DEPASSE, STATUT_PROCHE])].drop(columns=["id"], errors="ignore")
         if not alertes_exp.empty:
             alertes_exp.to_excel(w, sheet_name="Alertes", index=False)
+
+    # 4. Application de la mise en page (A4, Paysage, Ajusté à la largeur) sur chaque feuille
+    for ws in w.sheets.values():
+        ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+        ws.page_setup.paperSize = ws.PAPERSIZE_A4
+        ws.page_setup.fitToPage = True
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        # Répétition de la première ligne (en-têtes) sur toutes les pages imprimées
+        ws.print_title_rows = '1:1'
 
 st.download_button("⬇️ Exporter la sélection (Excel)", buf.getvalue(),
                    file_name=f"livraisons_filtrees_{datetime.now():%Y%m%d_%H%M}.xlsx",
