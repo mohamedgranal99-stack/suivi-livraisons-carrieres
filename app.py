@@ -639,12 +639,40 @@ with st.expander("🔎 Vérification des totaux par fichier, feuille et mois"):
                "fichier en trop. Comparez aussi chaque total avec la somme de la colonne "
                "Montant HT Net dans votre Excel.")
 
-# ---------- Filtres ----------
+# ---------- Filtres (liés entre eux) ----------
+FILTRES = {"f_mois": "Mois", "f_client": c_client, "f_produit": c_produit}
+if c_chantier:
+    FILTRES["f_chantier"] = "Chantier"
+
+
+def options_possibles(cle):
+    """Valeurs encore possibles pour un filtre, compte tenu des AUTRES filtres choisis."""
+    sub = df
+    for k, col in FILTRES.items():
+        choisi = st.session_state.get(k) or []
+        if k != cle and choisi:
+            sub = sub[sub[col].isin(choisi)]
+    return sorted(sub[FILTRES[cle]].astype(str).unique(), key=str)
+
+
+# retire les sélections devenues impossibles (ex. un produit qui n'appartient pas au client choisi)
+for _ in range(3):
+    for k in FILTRES:
+        valides = set(options_possibles(k))
+        st.session_state[k] = [v for v in (st.session_state.get(k) or []) if v in valides]
+
+
+def cb_reset_filtres():
+    for k in FILTRES:
+        st.session_state[k] = []
+
+
 st.sidebar.subheader("Filtres")
-mois = st.sidebar.multiselect("Mois", sorted(df["Mois"].astype(str).unique(), key=str))
-clients = st.sidebar.multiselect("Client", sorted(df[c_client].astype(str).unique(), key=str))
-produits = st.sidebar.multiselect("Produit", sorted(df[c_produit].astype(str).unique(), key=str))
-chantiers = (st.sidebar.multiselect("Chantier", sorted(df["Chantier"].unique(), key=str))
+st.sidebar.button("↺ Réinitialiser les filtres", on_click=cb_reset_filtres)
+mois = st.sidebar.multiselect("Mois", options_possibles("f_mois"), key="f_mois")
+clients = st.sidebar.multiselect("Client", options_possibles("f_client"), key="f_client")
+produits = st.sidebar.multiselect("Produit", options_possibles("f_produit"), key="f_produit")
+chantiers = (st.sidebar.multiselect("Chantier", options_possibles("f_chantier"), key="f_chantier")
              if c_chantier else [])
 
 mn, mx = float(df["Montant HT Net"].min()), float(df["Montant HT Net"].max())
