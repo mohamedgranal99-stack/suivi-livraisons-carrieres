@@ -477,8 +477,10 @@ def restaure_zip(contenu):
 # ---------- Bons de commande clients ----------
 FICHIER_BC = os.path.join(DOSSIER, "bons_commande.json")
 TOUS = "(tous les chantiers)"
-STATUT_OK, STATUT_PROCHE = "🟢 OK", "🟠 Proche du plafond"
-STATUT_DEPASSE, STATUT_CLOS = "🔴 Dépassé", "⚪ Clôturé"
+STATUT_OK, STATUT_PROCHE = "🟢 OK", "🟡 Alerte (seuil atteint)"
+STATUT_DEPASSE, STATUT_CLOS = "🔴 100 % atteint ou dépassé", "⚪ Clôturé"
+COULEURS_STATUT = {STATUT_DEPASSE: "background-color: #f8d7da; color: #842029",
+                   STATUT_PROCHE: "background-color: #fff3cd; color: #664d03"}
 
 
 def charge_bc():
@@ -567,6 +569,18 @@ def cb_bc_supprime(bid):
     msg("success", "Bon de commande supprimé." if len(reste) < len(bcs) else "Bon introuvable.")
 
 
+def colorie(d):
+    """Tableau d'alertes : lignes jaunes (seuil) et rouges (100 %)."""
+    d = d.drop(columns=["id"], errors="ignore")
+    formats = {"Montant BC (HT net)": "{:,.2f}", "Livré (HT net)": "{:,.2f}", "Reste": "{:,.2f}",
+               "Dépassement": "{:,.2f}", "% consommé": "{:.0f} %", "Qté livrée": "{:,.2f}"}
+    try:
+        return (d.style.apply(lambda r: [COULEURS_STATUT.get(r["Statut"], "")] * len(r), axis=1)
+                .format({k: v for k, v in formats.items() if k in d.columns}, na_rep=""))
+    except Exception:   # (jinja2 absent) : tableau sans couleurs
+        return d
+
+
 def _fr(iso):
     return f"{iso[8:10]}/{iso[5:7]}/{iso[0:4]}"
 
@@ -589,7 +603,7 @@ def calcule_situation(base, bcs, seuil):
         pct = livre / montant * 100 if montant > 0 else 0.0
         if bc.get("clos"):
             statut = STATUT_CLOS
-        elif livre > montant:
+        elif round(livre, 2) >= round(montant, 2):
             statut = STATUT_DEPASSE
         elif pct >= seuil:
             statut = STATUT_PROCHE
@@ -1042,15 +1056,17 @@ def fmt(x):
 bcs = charge_bc()
 seuil_alerte = int(st.session_state.get("bc_seuil", 80))
 sit = calcule_situation(df, bcs, seuil_alerte)
+n_rouge = n_jaune = 0
 if not sit.empty:
     depasses = sit[sit["Statut"] == STATUT_DEPASSE]
     proches = sit[sit["Statut"] == STATUT_PROCHE]
-    if len(depasses):
-        st.error("🔴 **Bon(s) de commande dépassé(s)** : " + " · ".join(
-            f"{r['Référence BC']} ({r['Client']}) +{fmt(r['Dépassement'])} Dh"
+    n_rouge, n_jaune = len(depasses), len(proches)
+    if n_rouge:
+        st.error("🔴 **Bon(s) de commande à 100 % ou plus** : " + " · ".join(
+            f"{r['Référence BC']} ({r['Client']}) {r['% consommé']:.0f} %"
             for _, r in depasses.iterrows()))
-    if len(proches):
-        st.warning(f"🟠 **Proche(s) du plafond (≥ {seuil_alerte} %)** : " + " · ".join(
+    if n_jaune:
+        st.warning(f"🟡 **Bon(s) de commande à {seuil_alerte} % ou plus** : " + " · ".join(
             f"{r['Référence BC']} ({r['Client']}) {r['% consommé']:.0f} %"
             for _, r in proches.iterrows()))
 
@@ -1094,12 +1110,33 @@ def afficher(cle, croise=None):
                      use_container_width=True)
 
 
-noms_onglets = ["📅 Par mois", "📆 Par jour", "🏭 Par carrière", "👥 Par client", "🪨 Par produit"]
+TAB_ALERTES = f"🚨 Alertes ({n_rouge + n_jaune})" if (n_rouge + n_jaune) else "🚨 Alertes"
+noms_onglets = [TAB_ALERTES, "📅 Par mois", "📆 Par jour", "🏭 Par carrière", "👥 Par client",
+                "🪨 Par produit"]
 if c_chantier:
     noms_onglets.append("🏗️ Par chantier")
 noms_onglets.append("📑 Bons de commande")
 noms_onglets.append("📋 Détail")
 onglets = dict(zip(noms_onglets, st.tabs(noms_onglets)))
+
+with onglets[TAB_ALERTES]:
+    st.caption(f"🟡 **Jaune** : bon consommé à {seuil_alerte} % ou plus · 🔴 **Rouge** : 100 % atteint "
+               f"ou dépassé. Le seuil jaune se règle dans l'onglet « Bons de commande ».")
+    if sit.empty:
+        st.info("Aucun bon de commande enregistré : ajoutez-en dans l'onglet « Bons de commande ».")
+    else:
+        al1, al2, al3 = st.columns(3)
+        al1.metric("🔴 À 100 % ou plus", n_rouge)
+        al2.metric("🟡 Au seuil d'alerte", n_jaune)
+        al3.metric("Dépassement total (Dh)", fmt(sit.loc[sit["Statut"] != STATUT_CLOS, "Dépassement"].sum()))
+        alertes = (sit[sit["Statut"].isin([STATUT_DEPASSE, STATUT_PROCHE])]
+                   .sort_values("% consommé", ascending=False))
+        if alertes.empty:
+            st.success(f"✅ Aucun bon de commande n'a atteint {seuil_alerte} %.")
+        else:
+            if not c_qte:
+                alertes = alertes.drop(columns=["Qté livrée"])
+            st.dataframe(colorie(alertes), use_container_width=True, hide_index=True)
 
 with onglets["📅 Par mois"]:
     afficher("Mois")
@@ -1128,8 +1165,8 @@ with onglets["📑 Bons de commande"]:
     else:
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Bons actifs", int((sit["Statut"] != STATUT_CLOS).sum()))
-        m2.metric("🔴 Dépassés", int((sit["Statut"] == STATUT_DEPASSE).sum()))
-        m3.metric("🟠 Proches du plafond", int((sit["Statut"] == STATUT_PROCHE).sum()))
+        m2.metric("🔴 À 100 % ou plus", n_rouge)
+        m3.metric("🟡 Au seuil d'alerte", n_jaune)
         m4.metric("Dépassement total (Dh)", fmt(sit.loc[sit["Statut"] != STATUT_CLOS, "Dépassement"].sum()))
         aff = sit.drop(columns=["id"]).sort_values("% consommé", ascending=False)
         if not c_qte:
