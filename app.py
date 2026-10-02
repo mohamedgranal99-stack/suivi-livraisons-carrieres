@@ -30,8 +30,6 @@ st.session_state.setdefault("cle", 0)
 
 # =====================================================================
 # AUTHENTIFICATION ET COMPTES UTILISATEURS
-#   - compte « de secours » permanent : défini dans les Secrets de Streamlit
-#   - autres comptes : créés / modifiés / supprimés par l'administrateur dans l'application
 # =====================================================================
 ITERATIONS = 200_000
 MAX_TENTATIVES = 5
@@ -112,7 +110,6 @@ def bloc_generateur():
         st.caption("Copiez cette ligne dans les Secrets, sous l'utilisateur concerné.")
 
 
-# ---------- Actions (appelées par les boutons) ----------
 def cb_genere():
     st.session_state["nu_mdp"] = "".join(pysecrets.choice(ALPHABET) for _ in range(10))
 
@@ -202,10 +199,10 @@ def connexion():
 
     if st.session_state.get("user"):
         actuel = comptes.get(st.session_state["user"]["login"])
-        if actuel:   # le rôle / nom sont relus à chaque fois (compte modifié par l'admin)
+        if actuel:
             return {**st.session_state["user"], "name": actuel.get("name", moi()),
                     "role": actuel.get("role", "user")}
-        st.session_state.clear()   # compte supprimé : déconnexion
+        st.session_state.clear()
         st.rerun()
 
     if not comptes:
@@ -231,7 +228,7 @@ def connexion():
             st.stop()
         cle_login = login.strip().lower()
         u = comptes.get(cle_login)
-        stocke = u.get("password_hash", "") if u else "x$1$00$00"   # même durée si inconnu
+        stocke = u.get("password_hash", "") if u else "x$1$00$00"
         if verifie_mdp(mdp, stocke) and u is not None:
             st.session_state["user"] = {"login": cle_login, "name": u.get("name", cle_login),
                                         "role": u.get("role", "user"),
@@ -263,6 +260,7 @@ with st.sidebar.expander("🔒 Changer mon mot de passe"):
 if est_admin:
     with st.sidebar.expander("🔑 Hash pour le compte de secours (Secrets)"):
         bloc_generateur()
+
 
 # ---------- Fonctions utilitaires ----------
 def nom_sur(nom):
@@ -297,14 +295,12 @@ def info_fichier(chemin):
 def to_num(s):
     if s.dtype == object:
         s = (s.astype(str).str.replace("\u00a0", "", regex=False).str.replace(" ", "", regex=False))
-        # "2.719,36" -> 2719.36 ; "2719,36" -> 2719.36
         s = s.where(~s.str.contains(",", regex=False), s.str.replace(".", "", regex=False))
         s = s.str.replace(",", ".", regex=False)
     return pd.to_numeric(s, errors="coerce")
 
 
 def texte_propre(serie):
-    """Texte sans espaces ; cellule vide -> chaîne vide."""
     return serie.where(serie.notna(), "").astype(str).str.strip()
 
 
@@ -331,7 +327,6 @@ def detecte_entete(raw):
 
 @st.cache_data(show_spinner="Lecture du fichier…")
 def lire_classeur(chemin, mtime):
-    """Lit toutes les feuilles d'un classeur (en-tête détecté automatiquement)."""
     xl = pd.ExcelFile(chemin)
     res = {}
     for nom in xl.sheet_names:
@@ -347,7 +342,7 @@ def lire_classeur(chemin, mtime):
 # ---------- Carrières (BS1, BS2, BS3, TG, KM, BA) ----------
 CARRIERES = ["BS1", "BS2", "BS3", "TG", "KM", "BA"]
 NON_CLASSEE = "Non classée"
-FICHIER_META = os.path.join(DOSSIER, "carrieres.json")   # {nom_fichier: {carriere, ajoute}}
+FICHIER_META = os.path.join(DOSSIER, "carrieres.json")
 
 
 def charge_meta():
@@ -367,7 +362,6 @@ def sauve_meta(d):
 
 
 def detecte_carriere(nom):
-    """Devine la carrière d'après le nom du fichier (None si absente ou ambiguë)."""
     n = nom.upper()
     trouvees = {"BS" + m.group(1)
                 for m in re.finditer(r"(?<![A-Z0-9])BS\s*[-_.]?\s*([123])(?![0-9])", n)}
@@ -386,7 +380,6 @@ def carriere_de(nom, meta=None):
 
 
 def date_ajout(nom, meta=None):
-    """Date d'enregistrement du fichier (sert à savoir quel fichier est le plus récent)."""
     meta = charge_meta() if meta is None else meta
     try:
         return float(meta[nom]["ajoute"])
@@ -421,7 +414,6 @@ def sauvegarde_zip():
 
 
 def restaure_zip(contenu):
-    """Restaure les fichiers d'une sauvegarde ZIP (ceux déjà présents sont conservés)."""
     nb, ignores = 0, 0
     m = charge_meta()
     existants = set(liste_fichiers())
@@ -504,7 +496,6 @@ def date_iso(v):
 
 
 def _bc_valide(ref, client, montant, periode, d1, d2, autres, ignorer_id=None):
-    """Renvoie un message d'erreur, ou None si les champs sont corrects."""
     if not ref:
         return "Saisissez la référence du bon de commande."
     if not client:
@@ -570,14 +561,13 @@ def cb_bc_supprime(bid):
 
 
 def colorie(d):
-    """Tableau d'alertes : lignes jaunes (seuil) et rouges (100 %)."""
     d = d.drop(columns=["id"], errors="ignore")
     formats = {"Montant BC (HT net)": "{:,.2f}", "Livré (HT net)": "{:,.2f}", "Reste": "{:,.2f}",
                "Dépassement": "{:,.2f}", "% consommé": "{:.0f} %", "Qté livrée": "{:,.2f}"}
     try:
         return (d.style.apply(lambda r: [COULEURS_STATUT.get(r["Statut"], "")] * len(r), axis=1)
                 .format({k: v for k, v in formats.items() if k in d.columns}, na_rep=""))
-    except Exception:   # (jinja2 absent) : tableau sans couleurs
+    except Exception:
         return d
 
 
@@ -586,7 +576,6 @@ def _fr(iso):
 
 
 def calcule_situation(base, bcs, seuil):
-    """Compare le montant livré (HT net) de chaque bon de commande à son montant."""
     colonnes = ["id", "Référence BC", "Client", "Chantier", "Période", "Montant BC (HT net)",
                 "Livré (HT net)", "Reste", "Dépassement", "% consommé", "Statut", "Qté livrée"]
     lignes = []
@@ -629,7 +618,6 @@ for typ, texte in st.session_state.pop("msgs", []):
 
 cle = st.session_state["cle"]
 
-# ---------- Gestion des utilisateurs (administrateur) ----------
 if est_admin:
     with st.expander("👥 Gestion des utilisateurs"):
         comptes = tous_comptes()
@@ -791,7 +779,7 @@ if est_admin:
         if fichiers and st.button("📦 Préparer la sauvegarde (ZIP)"):
             st.session_state["zip_pret"] = sauvegarde_zip()
         if st.session_state.get("zip_pret"):
-            st.download_button("⬇️ Télécharger la sauvegarde", st.session_state["zip_pret"],
+            st.download_button("⬇️️ Télécharger la sauvegarde", st.session_state["zip_pret"],
                                file_name=f"sauvegarde_livraisons_{datetime.now():%Y-%m-%d}.zip",
                                mime="application/zip")
         zipup = st.file_uploader("Restaurer depuis une sauvegarde (ZIP)", type=["zip"],
@@ -830,7 +818,7 @@ if not sel_fichiers:
     st.warning("Sélectionnez au moins un fichier dans la barre latérale.")
     st.stop()
 
-feuilles = {}   # label -> (fichier, feuille, df)
+feuilles = {}
 defaut, ignorees, vus = [], [], {}
 for fch in sel_fichiers:
     chemin = os.path.join(DOSSIER, fch)
@@ -847,7 +835,7 @@ for fch in sel_fichiers:
         elif any(m in feuille.lower() for m in MOTS_RECAP):
             ignorees.append(f"{label} (récapitulatif)")
         else:
-            h = (carriere_de(fch, meta_all), empreinte_df(d))   # identique = même carrière + même contenu
+            h = (carriere_de(fch, meta_all), empreinte_df(d))
             if h in vus:
                 ignorees.append(f"{label} (identique à « {vus[h]} »)")
             else:
@@ -874,7 +862,7 @@ df = pd.concat([feuilles[l][2].assign(Fichier=feuilles[l][0], Feuille=feuilles[l
 cols = [c for c in df.columns if c not in ("Fichier", "Feuille", "Carrière")]
 
 
-# ---------- Détection automatique des colonnes (silencieuse) ----------
+# ---------- Détection automatique des colonnes ----------
 def devine(mots):
     for m in mots:
         for c in cols:
@@ -943,13 +931,12 @@ if c_qte:
 # ---------- Mois (à partir de la colonne date) ----------
 d = pd.to_datetime(df[c_date], errors="coerce", dayfirst=True)
 valide = d.notna()
-# lignes sans date valide (ex. ligne de TOTAL en bas de feuille) : exclues du calcul
 sans_date = df.loc[~valide].copy()
 df = df.loc[valide].copy()
 df["Mois"] = d.loc[valide].dt.strftime("%Y-%m")
 df["Jour"] = d.loc[valide].dt.strftime("%Y-%m-%d")
 
-# ---------- Consolidation : le fichier le plus récent remplace les mêmes jours d'une même carrière ----------
+# ---------- Consolidation ----------
 n_remplacees = 0
 if remplacer and len(sel_fichiers) > 1:
     ordre = sorted(sel_fichiers, key=lambda x: (date_ajout(x, meta_all), x))
@@ -967,7 +954,7 @@ colonnes_source = [c for c in cols if c in df.columns] + ["Carrière"]
 n_dup = int(df.duplicated(subset=colonnes_source).sum())
 retirer = False
 if n_dup:
-    st.sidebar.warning(f"{n_dup} ligne(s) strictement identique(s) détectée(s).")
+    st.sidebar.warning(f"{n_dup} ligne(s) strictly identique(s) détectée(s).")
     retirer = st.sidebar.checkbox("Ignorer ces lignes en double", value=False,
                                   help="Attention : deux livraisons réelles parfaitement "
                                        "identiques seraient aussi retirées.")
@@ -988,10 +975,6 @@ with st.expander("🔎 Vérification des totaux par carrière, fichier, feuille 
         st.warning(f"{len(sans_date)} ligne(s) sans date valide ont été exclues du calcul "
                    f"(souvent la ligne de total du bas de la feuille) :")
         st.dataframe(sans_date, use_container_width=True)
-    st.caption("Si un même mois apparaît dans deux fichiers (ex. août dans le fichier de "
-               "septembre), ses livraisons sont comptées deux fois : retirez la feuille ou le "
-               "fichier en trop. Comparez aussi chaque total avec la somme de la colonne "
-               "Montant HT Net dans votre Excel.")
 
 # ---------- Filtres (liés entre eux) ----------
 FILTRES = {"f_carriere": "Carrière", "f_mois": "Mois", "f_client": c_client,
@@ -1001,7 +984,6 @@ if c_chantier:
 
 
 def options_possibles(cle):
-    """Valeurs encore possibles pour un filtre, compte tenu des AUTRES filtres choisis."""
     sub = df
     for k, col in FILTRES.items():
         choisi = st.session_state.get(k) or []
@@ -1010,7 +992,6 @@ def options_possibles(cle):
     return sorted(sub[FILTRES[cle]].astype(str).unique(), key=str)
 
 
-# retire les sélections devenues impossibles (ex. un produit qui n'appartient pas au client choisi)
 for _ in range(3):
     for k in FILTRES:
         valides = set(options_possibles(k))
@@ -1055,7 +1036,9 @@ def fmt(x):
 # ---------- Bons de commande : situation et alertes ----------
 bcs = charge_bc()
 seuil_alerte = int(st.session_state.get("bc_seuil", 80))
-sit = calcule_situation(df, bcs, seuil_alerte)
+
+# Calcul sur les données filtrées f
+sit = calcule_situation(f, bcs, seuil_alerte)
 n_rouge = n_jaune = 0
 if not sit.empty:
     depasses = sit[sit["Statut"] == STATUT_DEPASSE]
@@ -1078,7 +1061,7 @@ k3.metric("Nb de clients", f[c_client].nunique())
 if c_qte:
     k4.metric("Quantité totale", fmt(f["Quantité"].sum()))
 
-# ---------- Onglets ----------
+# ---------- Onglets & Génération des tableaux ----------
 MONTANT = "Montant HT Net"
 QTE = "Quantité (m³)" if (c_qte and "m3" in c_qte.lower().replace("³", "3")) else "Quantité (T)"
 indicateurs = [MONTANT] + ([QTE] if c_qte else [])
@@ -1088,7 +1071,6 @@ col_ind = "Quantité" if ind == QTE else "Montant HT Net"
 
 
 def resume(cle):
-    """Montant HT Net, quantité et nombre de livraisons regroupés par `cle`."""
     agg = {MONTANT: ("Montant HT Net", "sum")}
     if c_qte:
         agg[QTE] = ("Quantité", "sum")
@@ -1096,18 +1078,26 @@ def resume(cle):
     return f.groupby(cle, as_index=False).agg(**agg)
 
 
-def afficher(cle, croise=None):
+def get_tableau_complet(cle, croise=None):
     r = resume(cle)
     r = r.sort_values(cle) if cle in ("Mois", "Jour") else r.sort_values(ind, ascending=False)
-    st.bar_chart(r, x=cle, y=ind)
     total = {cle: "TOTAL", **{c: r[c].sum() for c in r.columns if c != cle}}
-    st.dataframe(pd.concat([r, pd.DataFrame([total])], ignore_index=True),
-                 use_container_width=True, hide_index=True)
+    df_table = pd.concat([r, pd.DataFrame([total])], ignore_index=True)
+    
+    df_croise = None
     if croise:
+        df_croise = f.pivot_table(index=cle, columns=croise, values=col_ind, aggfunc="sum",
+                                  fill_value=0, margins=True, margins_name="Total").reset_index()
+    return r, df_table, df_croise
+
+
+def afficher(cle, croise=None):
+    r, df_table, df_croise = get_tableau_complet(cle, croise)
+    st.bar_chart(r, x=cle, y=ind)
+    st.dataframe(df_table, use_container_width=True, hide_index=True)
+    if croise and df_croise is not None:
         st.markdown(f"**{cle} × {croise} — {ind}**")
-        st.dataframe(f.pivot_table(index=cle, columns=croise, values=col_ind, aggfunc="sum",
-                                   fill_value=0, margins=True, margins_name="Total"),
-                     use_container_width=True)
+        st.dataframe(df_croise, use_container_width=True)
 
 
 TAB_ALERTES = f"🚨 Alertes ({n_rouge + n_jaune})" if (n_rouge + n_jaune) else "🚨 Alertes"
@@ -1123,7 +1113,7 @@ with onglets[TAB_ALERTES]:
     st.caption(f"🟡 **Jaune** : bon consommé à {seuil_alerte} % ou plus · 🔴 **Rouge** : 100 % atteint "
                f"ou dépassé. Le seuil jaune se règle dans l'onglet « Bons de commande ».")
     if sit.empty:
-        st.info("Aucun bon de commande enregistré : ajoutez-en dans l'onglet « Bons de commande ».")
+        st.info("Aucun bon de commande enregistré ou correspondant à la sélection.")
     else:
         al1, al2, al3 = st.columns(3)
         al1.metric("🔴 À 100 % ou plus", n_rouge)
@@ -1157,7 +1147,7 @@ if c_chantier:
         afficher("Chantier", "Mois")
 with onglets["📑 Bons de commande"]:
     st.caption("Pour chaque bon de commande, le montant livré (Montant HT Net des livraisons du "
-               "client, toutes carrières confondues) est comparé au montant NET HT du bon.")
+               "client) est comparé au montant NET HT du bon selon les filtres sélectionnés.")
     st.number_input("Seuil d'alerte (% du bon déjà consommé)", min_value=10, max_value=100,
                     value=80, step=5, key="bc_seuil")
     if sit.empty:
@@ -1235,13 +1225,49 @@ with onglets["📑 Bons de commande"]:
 with onglets["📋 Détail"]:
     st.dataframe(f, use_container_width=True)
 
-# ---------- Export ----------
+# =====================================================================
+# 3) EXPORT EXCEL COMPLET (CONFORME AUX TABLEAUX AFFICHÉS)
+# =====================================================================
 buf = io.BytesIO()
 with pd.ExcelWriter(buf, engine="openpyxl") as w:
+    # 1. Détail filtré
     f.to_excel(w, sheet_name="Détail", index=False)
-    f.groupby("Mois")["Montant HT Net"].sum().to_excel(w, sheet_name="Par mois")
-    f.groupby(c_client)["Montant HT Net"].sum().to_excel(w, sheet_name="Par client")
-    f.groupby(c_produit)["Montant HT Net"].sum().to_excel(w, sheet_name="Par produit")
+    
+    # 2. Synthèses simples & croisées
+    _, t_mois, _ = get_tableau_complet("Mois")
+    t_mois.to_excel(w, sheet_name="Par mois", index=False)
+    
+    _, t_jour, _ = get_tableau_complet("Jour")
+    t_jour.to_excel(w, sheet_name="Par jour", index=False)
+    
+    _, t_car, c_car = get_tableau_complet("Carrière", "Mois")
+    t_car.to_excel(w, sheet_name="Par carrière", index=False)
+    if c_car is not None:
+        c_car.to_excel(w, sheet_name="Carrière x Mois", index=False)
+        
+    _, t_cli, c_cli = get_tableau_complet(c_client, "Mois")
+    t_cli.to_excel(w, sheet_name="Par client", index=False)
+    if c_cli is not None:
+        c_cli.to_excel(w, sheet_name="Client x Mois", index=False)
+        
+    _, t_prod, c_prod = get_tableau_complet(c_produit, "Client")
+    t_prod.to_excel(w, sheet_name="Par produit", index=False)
+    if c_prod is not None:
+        c_prod.to_excel(w, sheet_name="Produit x Client", index=False)
+        
+    if c_chantier:
+        _, t_cha, c_cha = get_tableau_complet("Chantier", "Mois")
+        t_cha.to_excel(w, sheet_name="Par chantier", index=False)
+        if c_cha is not None:
+            c_cha.to_excel(w, sheet_name="Chantier x Mois", index=False)
+            
+    # 3. Situation des Bons de Commande et Alertes
+    if not sit.empty:
+        sit.drop(columns=["id"], errors="ignore").to_excel(w, sheet_name="Bons de commande", index=False)
+        alertes_exp = sit[sit["Statut"].isin([STATUT_DEPASSE, STATUT_PROCHE])].drop(columns=["id"], errors="ignore")
+        if not alertes_exp.empty:
+            alertes_exp.to_excel(w, sheet_name="Alertes", index=False)
+
 st.download_button("⬇️ Exporter la sélection (Excel)", buf.getvalue(),
-                   file_name="livraisons_filtrees.xlsx",
+                   file_name=f"livraisons_filtrees_{datetime.now():%Y%m%d_%H%M}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
