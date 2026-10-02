@@ -1,7 +1,9 @@
 import hashlib
+import hmac
 import io
 import os
 import re
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -22,6 +24,108 @@ MOTS_ENTETE = ["date", "client", "produit", "désignation", "designation", "quan
 MOTS_RECAP = ["recap", "récap", "total", "cumul", "synth", "bilan", "global"]
 
 st.session_state.setdefault("cle", 0)
+
+# =====================================================================
+# AUTHENTIFICATION (comptes stockés dans les « Secrets » de Streamlit)
+# =====================================================================
+ITERATIONS = 200_000
+MAX_TENTATIVES = 5
+
+EXEMPLE_SECRETS = """[users.admin]
+name = "Administrateur"
+role = "admin"
+password_hash = "COLLER_ICI_LE_HASH"
+
+[users.ahmed]
+name = "Ahmed"
+role = "user"
+password_hash = "COLLER_ICI_LE_HASH"
+"""
+
+
+def hash_mdp(mdp):
+    sel = os.urandom(16)
+    h = hashlib.pbkdf2_hmac("sha256", mdp.encode("utf-8"), sel, ITERATIONS)
+    return f"pbkdf2_sha256${ITERATIONS}${sel.hex()}${h.hex()}"
+
+
+def verifie_mdp(mdp, stocke):
+    try:
+        _, iters, sel, h = stocke.split("$")
+        calc = hashlib.pbkdf2_hmac("sha256", mdp.encode("utf-8"), bytes.fromhex(sel), int(iters))
+        return hmac.compare_digest(calc.hex(), h)
+    except Exception:
+        return False
+
+
+def charge_utilisateurs():
+    try:
+        return {str(k).strip().lower(): dict(v) for k, v in st.secrets["users"].items()}
+    except Exception:
+        return {}
+
+
+def bloc_generateur():
+    mdp = st.text_input("Mot de passe à transformer en hash", type="password", key="gen_mdp")
+    if mdp:
+        if len(mdp) < 8:
+            st.warning("Utilisez au moins 8 caractères.")
+        st.code(f'password_hash = "{hash_mdp(mdp)}"', language="toml")
+        st.caption("Copiez cette ligne dans les Secrets, sous l'utilisateur concerné.")
+
+
+def connexion():
+    if st.session_state.get("user"):
+        return st.session_state["user"]
+
+    users = charge_utilisateurs()
+    if not users:
+        st.warning("🔧 Configuration initiale : aucun utilisateur n'est défini.")
+        st.markdown("1. Saisissez un mot de passe ci-dessous pour obtenir son **hash**.  \n"
+                    "2. Dans Streamlit Cloud : **Manage app → Settings → Secrets**, collez le "
+                    "modèle suivant en remplaçant les hash.  \n"
+                    "3. Enregistrez, puis rechargez cette page.")
+        bloc_generateur()
+        st.code(EXEMPLE_SECRETS, language="toml")
+        st.stop()
+
+    st.subheader("🔐 Connexion")
+    with st.form("login"):
+        login = st.text_input("Identifiant")
+        mdp = st.text_input("Mot de passe", type="password")
+        ok = st.form_submit_button("Se connecter", type="primary")
+
+    if ok:
+        n = st.session_state.get("tentatives", 0)
+        if n >= MAX_TENTATIVES:
+            st.error("Trop de tentatives échouées. Rechargez la page et réessayez plus tard.")
+            st.stop()
+        u = users.get(login.strip().lower())
+        stocke = u.get("password_hash", "") if u else "x$1$00$00"   # même durée si inconnu
+        if verifie_mdp(mdp, stocke) and u is not None:
+            st.session_state["user"] = {"login": login.strip().lower(),
+                                        "name": u.get("name", login.strip()),
+                                        "role": u.get("role", "user")}
+            st.session_state["tentatives"] = 0
+            st.rerun()
+        st.session_state["tentatives"] = n + 1
+        time.sleep(1)
+        st.error("Identifiant ou mot de passe incorrect.")
+    st.stop()
+
+
+user = connexion()
+est_admin = user["role"] == "admin"
+st.sidebar.markdown(f"👤 **{user['name']}**  \n"
+                    f"<small>{'Administrateur' if est_admin else 'Utilisateur'}</small>",
+                    unsafe_allow_html=True)
+if st.sidebar.button("🚪 Se déconnecter"):
+    st.session_state.clear()
+    st.rerun()
+if est_admin:
+    with st.sidebar.expander("🔑 Générer un mot de passe haché"):
+        bloc_generateur()
+
 
 
 # ---------- Fonctions utilitaires ----------
@@ -109,68 +213,72 @@ def lire_classeur(chemin, mtime):
 for typ, texte in st.session_state.pop("msgs", []):
     getattr(st, typ)(texte)
 
-st.subheader("📁 Fichiers enregistrés sur la plateforme")
 fichiers = liste_fichiers()
 cle = st.session_state["cle"]
 
-if fichiers:
-    for i, nom in enumerate(fichiers):
-        chemin = os.path.join(DOSSIER, nom)
-        c1, c2, c3, c4 = st.columns([5, 1.7, 1.8, 1.8])
-        c1.markdown(f"**📄 {nom}**  \n<small>{info_fichier(chemin)}</small>",
-                    unsafe_allow_html=True)
-        with open(chemin, "rb") as fh:
-            c2.download_button("⬇️ Télécharger", fh.read(), file_name=nom, key=f"dl_{i}")
+if est_admin:
+    st.subheader("📁 Fichiers enregistrés sur la plateforme")
 
-        with c3.popover("✏️ Remplacer"):
-            nouveau = st.file_uploader("Nouveau fichier Excel", type=TYPES, key=f"rep_{i}_{cle}")
-            if nouveau is not None and st.button("Confirmer le remplacement", key=f"okrep_{i}"):
-                nouveau_nom = nom_sur(nouveau.name)
-                if nouveau_nom != nom and nouveau_nom in fichiers:
-                    st.error("Un fichier portant ce nom existe déjà.")
-                else:
-                    with open(os.path.join(DOSSIER, nouveau_nom), "wb") as fh:
-                        fh.write(nouveau.getvalue())
-                    if nouveau_nom != nom:
-                        os.remove(chemin)
-                    msg("success", f"« {nom} » a été remplacé par « {nouveau_nom} ».")
+    if fichiers:
+        for i, nom in enumerate(fichiers):
+            chemin = os.path.join(DOSSIER, nom)
+            c1, c2, c3, c4 = st.columns([5, 1.7, 1.8, 1.8])
+            c1.markdown(f"**📄 {nom}**  \n<small>{info_fichier(chemin)}</small>",
+                        unsafe_allow_html=True)
+            with open(chemin, "rb") as fh:
+                c2.download_button("⬇️ Télécharger", fh.read(), file_name=nom, key=f"dl_{i}")
+
+            with c3.popover("✏️ Remplacer"):
+                nouveau = st.file_uploader("Nouveau fichier Excel", type=TYPES, key=f"rep_{i}_{cle}")
+                if nouveau is not None and st.button("Confirmer le remplacement", key=f"okrep_{i}"):
+                    nouveau_nom = nom_sur(nouveau.name)
+                    if nouveau_nom != nom and nouveau_nom in fichiers:
+                        st.error("Un fichier portant ce nom existe déjà.")
+                    else:
+                        with open(os.path.join(DOSSIER, nouveau_nom), "wb") as fh:
+                            fh.write(nouveau.getvalue())
+                        if nouveau_nom != nom:
+                            os.remove(chemin)
+                        msg("success", f"« {nom} » a été remplacé par « {nouveau_nom} ».")
+                        st.session_state["cle"] += 1
+                        st.rerun()
+
+            with c4.popover("🗑️ Supprimer"):
+                st.write(f"Supprimer **{nom}** ?")
+                if st.button("Oui, supprimer", key=f"del_{i}"):
+                    os.remove(chemin)
+                    msg("success", f"« {nom} » a été supprimé.")
                     st.session_state["cle"] += 1
                     st.rerun()
+    else:
+        st.info("Aucun fichier enregistré. Ajoutez votre fichier Excel ci-dessous.")
 
-        with c4.popover("🗑️ Supprimer"):
-            st.write(f"Supprimer **{nom}** ?")
-            if st.button("Oui, supprimer", key=f"del_{i}"):
-                os.remove(chemin)
-                msg("success", f"« {nom} » a été supprimé.")
-                st.session_state["cle"] += 1
-                st.rerun()
-else:
-    st.info("Aucun fichier enregistré. Ajoutez votre fichier Excel ci-dessous.")
-
-with st.expander("➕ Ajouter des fichiers", expanded=not fichiers):
-    ajouts = st.file_uploader("Fichier(s) Excel de suivi", type=TYPES,
-                              accept_multiple_files=True, key=f"add_{cle}")
-    if ajouts and st.button("💾 Enregistrer sur la plateforme", type="primary"):
-        existants = {empreinte_fichier(os.path.join(DOSSIER, f)): f for f in liste_fichiers()}
-        for up in ajouts:
-            contenu = up.getvalue()
-            nom_up = nom_sur(up.name)
-            h = empreinte_octets(contenu)
-            if h in existants:
-                msg("warning", f"« {up.name} » est identique à « {existants[h]} » déjà "
-                               f"enregistré : ignoré (pas de doublon).")
-            elif nom_up in existants.values():
-                msg("warning", f"Un fichier nommé « {nom_up} » existe déjà : utilisez "
-                               f"« Remplacer » pour le mettre à jour.")
-            else:
-                with open(os.path.join(DOSSIER, nom_up), "wb") as fh:
-                    fh.write(contenu)
-                existants[h] = nom_up
-                msg("success", f"« {nom_up} » enregistré.")
-        st.session_state["cle"] += 1
-        st.rerun()
+    with st.expander("➕ Ajouter des fichiers", expanded=not fichiers):
+        ajouts = st.file_uploader("Fichier(s) Excel de suivi", type=TYPES,
+                                  accept_multiple_files=True, key=f"add_{cle}")
+        if ajouts and st.button("💾 Enregistrer sur la plateforme", type="primary"):
+            existants = {empreinte_fichier(os.path.join(DOSSIER, f)): f for f in liste_fichiers()}
+            for up in ajouts:
+                contenu = up.getvalue()
+                nom_up = nom_sur(up.name)
+                h = empreinte_octets(contenu)
+                if h in existants:
+                    msg("warning", f"« {up.name} » est identique à « {existants[h]} » déjà "
+                                   f"enregistré : ignoré (pas de doublon).")
+                elif nom_up in existants.values():
+                    msg("warning", f"Un fichier nommé « {nom_up} » existe déjà : utilisez "
+                                   f"« Remplacer » pour le mettre à jour.")
+                else:
+                    with open(os.path.join(DOSSIER, nom_up), "wb") as fh:
+                        fh.write(contenu)
+                    existants[h] = nom_up
+                    msg("success", f"« {nom_up} » enregistré.")
+            st.session_state["cle"] += 1
+            st.rerun()
 
 if not fichiers:
+    if not est_admin:
+        st.info("Aucun fichier disponible pour le moment. Contactez l'administrateur.")
     st.stop()
 
 st.divider()
