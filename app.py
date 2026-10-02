@@ -60,8 +60,10 @@ def msg(typ, texte):
 
 def to_num(s):
     if s.dtype == object:
-        s = (s.astype(str).str.replace("\u00a0", "", regex=False).str.replace(" ", "", regex=False)
-             .str.replace(",", ".", regex=False))
+        s = (s.astype(str).str.replace("\u00a0", "", regex=False).str.replace(" ", "", regex=False))
+        # "2.719,36" -> 2719.36 ; "2719,36" -> 2719.36
+        s = s.where(~s.str.contains(",", regex=False), s.str.replace(".", "", regex=False))
+        s = s.str.replace(",", ".", regex=False)
     return pd.to_numeric(s, errors="coerce")
 
 
@@ -303,12 +305,16 @@ if retirer:
     df = df.drop_duplicates(subset=colonnes_source)
 
 # ---------- Vérification des totaux ----------
-with st.expander("🔎 Vérification des totaux par fichier et feuille"):
-    verif = (df.groupby(["Fichier", "Feuille"])
-             .agg(Lignes=("Montant HT Net", "size"), Montant_HT_Net=("Montant HT Net", "sum"))
-             .reset_index())
+with st.expander("🔎 Vérification des totaux par fichier, feuille et mois"):
+    agg = {"Lignes": ("Montant HT Net", "size"), "Montant_HT_Net": ("Montant HT Net", "sum")}
+    if c_qte:
+        agg["Quantité"] = ("Quantité", "sum")
+    verif = df.groupby(["Fichier", "Feuille", "Mois"]).agg(**agg).reset_index()
     st.dataframe(verif, use_container_width=True)
-    st.caption("Comparez ces totaux avec ceux de votre Excel pour repérer une feuille en trop.")
+    st.caption("Si un même mois apparaît dans deux fichiers (ex. août dans le fichier de "
+               "septembre), ses livraisons sont comptées deux fois : retirez la feuille ou le "
+               "fichier en trop. Comparez aussi chaque total avec la somme de la colonne "
+               "Montant HT Net dans votre Excel.")
 
 # ---------- Filtres ----------
 st.sidebar.subheader("Filtres")
