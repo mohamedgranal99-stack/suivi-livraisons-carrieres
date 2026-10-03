@@ -10,15 +10,13 @@ import zipfile
 from datetime import datetime
 
 import pandas as pd
+import requests
 import streamlit as st
 
 st.set_page_config(page_title="Suivi livraisons carrières", page_icon="🚚", layout="wide")
 st.title("🚚 Suivi des livraisons – Matériaux de carrière")
 
-DOSSIER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "donnees_enregistrees")
-os.makedirs(DOSSIER, exist_ok=True)
 TYPES = ["xlsx", "xlsm", "xls"]
-EXT = tuple("." + t for t in TYPES)
 
 MOTS_ENTETE = ["date", "client", "produit", "désignation", "designation", "quant", "qté", "qte",
                "prix", "p.u", "montant", "ht", "net", "tonnage", "matière", "matiere", "bl", "n°",
@@ -29,13 +27,110 @@ MOTS_RECAP = ["recap", "récap", "total", "cumul", "synth", "bilan", "global"]
 st.session_state.setdefault("cle", 0)
 
 # =====================================================================
+# BASE DE DONNÉES SUPABASE (stockage permanent)
+# =====================================================================
+TABLE = "livraisons_carrieres"
+COLS_LIV = ("id,carriere,date_livraison,client,produit,qte_tonnes,qte_m3,montant_ht,chantier,"
+            "fichier,feuille,created_at")
+SANS_FICHIER = "(sans fichier)"
+
+
+def _config():
+    try:
+        s = st.secrets["supabase"]
+        return s["url"].rstrip("/") + "/rest/v1", s["key"]
+    except Exception:
+        st.error("Configuration Supabase manquante : ajoutez la section [supabase] "
+                 "(url, key) dans les Secrets de l'application.")
+        st.stop()
+
+
+def _entetes(extra=None):
+    _, cle_api = _config()
+    h = {"apikey": cle_api}
+    if cle_api.startswith("eyJ"):  # ancienne clé JWT (service_role) ; les nouvelles clés sb_secret_ n'en ont pas besoin
+        h["Authorization"] = f"Bearer {cle_api}"
+    return {**h, **(extra or {})}
+
+
+def sb_lire(table, params=None):
+    """Lit toute une table par pages de 1000 lignes."""
+    base, _ = _config()
+    lignes, debut, pas = [], 0, 1000
+    while True:
+        r = requests.get(f"{base}/{table}", params=params, timeout=60,
+                         headers=_entetes({"Range-Unit": "items",
+                                           "Range": f"{debut}-{debut + pas - 1}"}))
+        if r.status_code == 416:
+            return lignes
+        r.raise_for_status()
+        lot = r.json()
+        lignes.extend(lot)
+        if len(lot) < pas:
+            return lignes
+        debut += pas
+
+
+def sb_ecrire(methode, table, params=None, json_=None, extra=None):
+    base, _ = _config()
+    r = requests.request(methode, f"{base}/{table}", params=params, json=json_, timeout=120,
+                         headers=_entetes({"Content-Type": "application/json",
+                                           "Prefer": "return=minimal", **(extra or {})}))
+    if not r.ok:
+        raise RuntimeError(f"Supabase {r.status_code} : {r.text[:300]}")
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _kv_lire(cle):
+    rows = sb_lire("kv", {"select": "valeur", "cle": f"eq.{cle}"})
+    return rows[0]["valeur"] if rows else None
+
+
+def kv_get(cle, defaut):
+    v = _kv_lire(cle)
+    return defaut if v is None else v
+
+
+def kv_set(cle, valeur):
+    sb_ecrire("POST", "kv", params={"on_conflict": "cle"}, json_={"cle": cle, "valeur": valeur},
+              extra={"Prefer": "resolution=merge-duplicates,return=minimal"})
+    _kv_lire.clear()
+
+
+@st.cache_data(ttl=3600, show_spinner="Chargement des livraisons…")
+def charge_livraisons():
+    d = pd.DataFrame(sb_lire(TABLE, {"select": COLS_LIV, "order": "id"}),
+                     columns=COLS_LIV.split(","))
+    for c in ("qte_tonnes", "qte_m3", "montant_ht"):
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d["created_at"] = pd.to_datetime(d["created_at"], errors="coerce", utc=True)
+    d["fichier"] = d["fichier"].where(d["fichier"].notna() & (d["fichier"] != ""), SANS_FICHIER)
+    d["carriere"] = d["carriere"].where(d["carriere"].notna() & (d["carriere"] != ""), "Non classée")
+    return d
+
+
+def filtre_fichier(nom):
+    return {"fichier": "is.null"} if nom == SANS_FICHIER else {"fichier": f"eq.{nom}"}
+
+
+def sb_supprime_ids(ids):
+    for i in range(0, len(ids), 150):
+        lot = ",".join(str(int(x)) for x in ids[i:i + 150])
+        sb_ecrire("DELETE", TABLE, params={"id": f"in.({lot})"})
+
+
+try:
+    _kv_lire("comptes")
+except Exception as e:
+    st.error(f"Impossible de joindre la base Supabase : {e}")
+    st.stop()
+
+
+# =====================================================================
 # AUTHENTIFICATION ET COMPTES UTILISATEURS
 # =====================================================================
 ITERATIONS = 200_000
 MAX_TENTATIVES = 5
-DOSSIER_COMPTES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "comptes_utilisateurs")
-os.makedirs(DOSSIER_COMPTES, exist_ok=True)
-FICHIER_COMPTES = os.path.join(DOSSIER_COMPTES, "utilisateurs.json")
 RE_LOGIN = re.compile(r"^[a-z0-9_.-]{3,30}$")
 ROLES = {"user": "Utilisateur", "admin": "Administrateur"}
 ALPHABET = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789"
@@ -67,19 +162,12 @@ def verifie_mdp(mdp, stocke):
 
 
 def comptes_fichier():
-    try:
-        with open(FICHIER_COMPTES, encoding="utf-8") as fh:
-            d = json.load(fh)
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
+    d = kv_get("comptes", {})
+    return d if isinstance(d, dict) else {}
 
 
 def sauve_comptes(d):
-    tmp = FICHIER_COMPTES + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(d, fh, ensure_ascii=False, indent=2)
-    os.replace(tmp, FICHIER_COMPTES)
+    kv_set("comptes", d)
 
 
 def comptes_secrets():
@@ -267,29 +355,8 @@ def nom_sur(nom):
     return re.sub(r"[^\w\-. ()]", "_", os.path.basename(nom)).strip()
 
 
-def liste_fichiers():
-    return sorted(f for f in os.listdir(DOSSIER) if f.lower().endswith(EXT))
-
-
-def empreinte_octets(contenu):
-    return hashlib.md5(contenu).hexdigest()
-
-
-def empreinte_fichier(chemin):
-    with open(chemin, "rb") as fh:
-        return empreinte_octets(fh.read())
-
-
 def empreinte_df(d):
     return hashlib.md5(d.astype(str).to_csv(index=False).encode("utf-8")).hexdigest()
-
-
-def info_fichier(chemin):
-    st_ = os.stat(chemin)
-    ko = st_.st_size / 1024
-    taille = f"{ko:,.0f} Ko".replace(",", " ")
-    date = datetime.fromtimestamp(st_.st_mtime).strftime("%d/%m/%Y %H:%M")
-    return f"{taille} · enregistré le {date}"
 
 
 def to_num(s):
@@ -325,40 +392,11 @@ def detecte_entete(raw):
     return ligne if meilleur >= 2 else 0
 
 
-@st.cache_data(show_spinner="Lecture du fichier…")
-def lire_classeur(chemin, mtime):
-    xl = pd.ExcelFile(chemin)
-    res = {}
-    for nom in xl.sheet_names:
-        raw = xl.parse(nom, header=None)
-        h = detecte_entete(raw)
-        d = xl.parse(nom, header=h)
-        d.columns = unique_cols(d.columns)
-        d = d.dropna(how="all").dropna(axis=1, how="all")
-        res[nom] = d
-    return res
-
-
 # ---------- Carrières (BS1, BS2, BS3, TG, KM, BA) ----------
 CARRIERES = ["BS1", "BS2", "BS3", "TG", "KM", "BA"]
 NON_CLASSEE = "Non classée"
-FICHIER_META = os.path.join(DOSSIER, "carrieres.json")
-
-
-def charge_meta():
-    try:
-        with open(FICHIER_META, encoding="utf-8") as fh:
-            d = json.load(fh)
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
-
-
-def sauve_meta(d):
-    tmp = FICHIER_META + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(d, fh, ensure_ascii=False, indent=2)
-    os.replace(tmp, FICHIER_META)
+MOIS_FR = ["JANVIER", "FÉVRIER", "MARS", "AVRIL", "MAI", "JUIN", "JUILLET", "AOÛT",
+           "SEPTEMBRE", "OCTOBRE", "NOVEMBRE", "DÉCEMBRE"]
 
 
 def detecte_carriere(nom):
@@ -371,103 +409,154 @@ def detecte_carriere(nom):
     return next(iter(trouvees)) if len(trouvees) == 1 else None
 
 
-def carriere_de(nom, meta=None):
-    meta = charge_meta() if meta is None else meta
-    c = (meta.get(nom) or {}).get("carriere")
-    if c in CARRIERES:
-        return c
-    return detecte_carriere(nom) or NON_CLASSEE
+# ---------- Lecture d'un fichier Excel => lignes prêtes pour la base ----------
+def devine_col(cols, mots):
+    for m in mots:
+        for c in cols:
+            if m in c.lower():
+                return c
+    return None
 
 
-def date_ajout(nom, meta=None):
-    meta = charge_meta() if meta is None else meta
+def transforme_feuille(d, car, nom, feuille):
+    """Retourne (lignes, motif_si_ignorée, nb_lignes_sans_date)."""
+    cols = list(d.columns)
+    c_client = devine_col(cols, ["client", "société", "societe", "raison", "destinataire",
+                                 "tiers", "chantier"])
+    c_produit = devine_col(cols, ["produit", "désignation", "designation", "article", "matière",
+                                  "matiere", "nature"])
+    c_date = devine_col(cols, ["date"])
+    c_qte = devine_col(cols, ["qté en t", "qte en t", "tonnage", "quant", "qté", "qte", "poids"])
+    c_pu = devine_col(cols, ["p.u ht", "p.u", "prix", "pu"])
+    c_net = devine_col(cols, ["montant ht net", "ht net", "net ht", "montant ht", "total ht",
+                              "montant"])
+    c_chantier = devine_col(cols, ["chantier", "destination", "lieu"])
+    manque = [n for n, c in (("Client", c_client), ("Produit", c_produit), ("Date", c_date))
+              if c is None]
+    if manque:
+        return None, "colonne(s) non détectée(s) : " + ", ".join(manque), 0
+    if c_net:
+        montant = to_num(d[c_net])
+    elif c_qte and c_pu:
+        montant = to_num(d[c_qte]) * to_num(d[c_pu])
+    else:
+        return None, "colonne « Montant HT » introuvable", 0
+
+    cl, pr = texte_propre(d[c_client]), texte_propre(d[c_produit])
+    ok = (~cl.str.lower().isin(["", "nan", "none"])
+          & ~cl.str.lower().str.contains("total")
+          & ~pr.str.lower().str.contains("total"))
+    dt = pd.to_datetime(d[c_date], errors="coerce", dayfirst=True)
+    valide = dt.notna()
+    nb_sans_date = int((ok & ~valide).sum())
+    garde = ok & valide
+    if not garde.any():
+        return None, "aucune ligne exploitable", nb_sans_date
+
+    dts = dt[garde]
+    out = pd.DataFrame({
+        "carriere": car,
+        "mois_annee": [f"{MOIS_FR[x.month - 1]} -{x.year % 100:02d}" for x in dts],
+        "date_livraison": dts.dt.strftime("%Y-%m-%d").to_numpy(),
+        "client": cl[garde].to_numpy(),
+        "produit": pr[garde].to_numpy(),
+    })
+    qte = to_num(d[c_qte])[garde].fillna(0).to_numpy() if c_qte else None
+    en_m3 = bool(c_qte) and "m3" in c_qte.lower().replace("³", "3")
+    out["qte_tonnes"] = qte if (qte is not None and not en_m3) else float("nan")
+    out["qte_m3"] = qte if (qte is not None and en_m3) else float("nan")
+    out["montant_ht"] = montant[garde].fillna(0).round(4).to_numpy()
+    if c_chantier:
+        ch = texte_propre(d[c_chantier])[garde]
+        out["chantier"] = ch.where(~ch.str.lower().isin(["", "nan", "none", "nat"]), None).to_numpy()
+    else:
+        out["chantier"] = None
+    out["fichier"] = nom
+    out["feuille"] = feuille
+    return out, "", nb_sans_date
+
+
+def prepare_excel(contenu, nom, car, avec_recap=False):
+    xl = pd.ExcelFile(io.BytesIO(contenu))
+    morceaux, ignorees, vus, sans_date = [], [], set(), 0
+    for feuille in xl.sheet_names:
+        raw = xl.parse(feuille, header=None)
+        d = xl.parse(feuille, header=detecte_entete(raw))
+        d.columns = unique_cols(d.columns)
+        d = d.dropna(how="all").dropna(axis=1, how="all")
+        if d.empty:
+            ignorees.append(f"{feuille} (vide)")
+            continue
+        if not avec_recap and any(m in feuille.lower() for m in MOTS_RECAP):
+            ignorees.append(f"{feuille} (récapitulatif)")
+            continue
+        e = empreinte_df(d)
+        if e in vus:
+            ignorees.append(f"{feuille} (identique à une autre feuille)")
+            continue
+        vus.add(e)
+        t, motif, nsd = transforme_feuille(d, car, nom, str(feuille))
+        sans_date += nsd
+        if t is None:
+            ignorees.append(f"{feuille} ({motif})")
+            continue
+        morceaux.append(t)
+    rows = pd.concat(morceaux, ignore_index=True) if morceaux else pd.DataFrame()
+    return rows, ignorees, sans_date
+
+
+def importer(contenu, nom, car, remplace_jours=True, ancien_nom=None, avec_recap=False):
+    """Lit le fichier Excel et l'enregistre dans la base. Retourne (type_message, texte)."""
     try:
-        return float(meta[nom]["ajoute"])
-    except Exception:
-        try:
-            return os.path.getmtime(os.path.join(DOSSIER, nom))
-        except OSError:
-            return 0.0
+        rows, ignorees, sans_date = prepare_excel(contenu, nom, car, avec_recap)
+    except Exception as e:
+        return "error", f"« {nom} » : lecture impossible ({e})."
+    if rows.empty:
+        return "warning", (f"« {nom} » : aucune ligne exploitable, rien n'a été enregistré."
+                           + (f" Feuilles ignorées : {', '.join(ignorees)}." if ignorees else ""))
+    try:
+        existant = charge_livraisons()
+        a_suppr = set()
+        if remplace_jours and not existant.empty:
+            m = existant[(existant["carriere"] == car)
+                         & existant["date_livraison"].isin(set(rows["date_livraison"]))]
+            a_suppr.update(int(i) for i in m["id"])
+        if ancien_nom:
+            a_suppr.update(int(i) for i in existant.loc[existant["fichier"] == ancien_nom, "id"])
+        enregistrements = json.loads(rows.to_json(orient="records", force_ascii=False))
+        for i in range(0, len(enregistrements), 500):
+            sb_ecrire("POST", TABLE, json_=enregistrements[i:i + 500])
+        sb_supprime_ids(sorted(a_suppr))
+    except Exception as e:
+        return "error", f"« {nom} » : échec de l'enregistrement ({e})."
+    finally:
+        charge_livraisons.clear()
+    texte = f"« {nom} » enregistré ({car}) : {len(rows)} ligne(s)"
+    if a_suppr:
+        texte += f", {len(a_suppr)} ancienne(s) ligne(s) remplacée(s)"
+    texte += "."
+    if sans_date:
+        texte += f" {sans_date} ligne(s) sans date valide ignorée(s)."
+    if ignorees:
+        texte += f" Feuilles ignorées : {', '.join(ignorees)}."
+    return "success", texte
 
 
 def cb_carriere(nom, cle_widget):
     v = st.session_state.get(cle_widget)
-    m = charge_meta()
-    if nom not in m:
-        m[nom] = {"ajoute": date_ajout(nom, m)}
-    m[nom]["carriere"] = v if v in CARRIERES else NON_CLASSEE
-    sauve_meta(m)
+    sb_ecrire("PATCH", TABLE, params=filtre_fichier(nom), json_={"carriere": v})
+    charge_livraisons.clear()
 
 
 def sauvegarde_zip():
     buf = io.BytesIO()
-    meta = charge_meta()
-    noms = liste_fichiers()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for nom in noms:
-            z.write(os.path.join(DOSSIER, nom), arcname=nom)
-        z.writestr("carrieres.json", json.dumps(
-            {n: {"carriere": carriere_de(n, meta), "ajoute": date_ajout(n, meta)} for n in noms},
-            ensure_ascii=False, indent=2))
+        z.writestr("livraisons.csv", charge_livraisons().to_csv(index=False).encode("utf-8-sig"))
         z.writestr("bons_commande.json", json.dumps(charge_bc(), ensure_ascii=False, indent=2))
     return buf.getvalue()
 
 
-def restaure_zip(contenu):
-    nb, ignores = 0, 0
-    m = charge_meta()
-    existants = set(liste_fichiers())
-    with zipfile.ZipFile(io.BytesIO(contenu)) as z:
-        try:
-            info = json.loads(z.read("carrieres.json").decode("utf-8"))
-        except Exception:
-            info = {}
-        for nom_zip in z.namelist():
-            nom = nom_sur(nom_zip)
-            if nom_zip.endswith("/") or not nom.lower().endswith(EXT):
-                continue
-            if nom in existants:
-                ignores += 1
-                continue
-            with open(os.path.join(DOSSIER, nom), "wb") as fh:
-                fh.write(z.read(nom_zip))
-            mi = info.get(nom) or {}
-            car = mi.get("carriere")
-            try:
-                ajoute = float(mi.get("ajoute"))
-            except (TypeError, ValueError):
-                ajoute = time.time()
-            m[nom] = {"carriere": car if car in CARRIERES else (detecte_carriere(nom) or NON_CLASSEE),
-                      "ajoute": ajoute}
-            nb += 1
-        nb_bc = 0
-        try:
-            bcs_zip = json.loads(z.read("bons_commande.json").decode("utf-8"))
-        except Exception:
-            bcs_zip = []
-        if isinstance(bcs_zip, list) and bcs_zip:
-            bcs_actuels = charge_bc()
-            ids = {b.get("id") for b in bcs_actuels}
-            for b in bcs_zip:
-                try:
-                    if isinstance(b, dict) and b.get("id") and b["id"] not in ids and b["ref"] and b["client"]:
-                        bcs_actuels.append({
-                            "id": str(b["id"]), "ref": str(b["ref"]), "client": str(b["client"]),
-                            "chantier": str(b.get("chantier") or ""), "montant": float(b["montant"]),
-                            "date_debut": str(b.get("date_debut") or ""), "date_fin": str(b.get("date_fin") or ""),
-                            "clos": bool(b.get("clos")), "note": str(b.get("note") or ""),
-                            "cree_par": str(b.get("cree_par") or ""), "cree_le": str(b.get("cree_le") or "")})
-                        ids.add(b["id"])
-                        nb_bc += 1
-                except (KeyError, TypeError, ValueError):
-                    continue
-            sauve_bc(bcs_actuels)
-    sauve_meta(m)
-    return nb, ignores, nb_bc
-
-
 # ---------- Bons de commande clients ----------
-FICHIER_BC = os.path.join(DOSSIER, "bons_commande.json")
 TOUS = "(tous les chantiers)"
 STATUT_OK, STATUT_PROCHE = "🟢 OK", "🟡 Alerte (seuil atteint)"
 STATUT_DEPASSE, STATUT_CLOS = "🔴 100 % atteint ou dépassé", "⚪ Clôturé"
@@ -476,19 +565,12 @@ COULEURS_STATUT = {STATUT_DEPASSE: "background-color: #f8d7da; color: #842029",
 
 
 def charge_bc():
-    try:
-        with open(FICHIER_BC, encoding="utf-8") as fh:
-            d = json.load(fh)
-        return d if isinstance(d, list) else []
-    except Exception:
-        return []
+    d = kv_get("bons_commande", [])
+    return d if isinstance(d, list) else []
 
 
 def sauve_bc(liste):
-    tmp = FICHIER_BC + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(liste, fh, ensure_ascii=False, indent=2)
-    os.replace(tmp, FICHIER_BC)
+    kv_set("bons_commande", liste)
 
 
 def date_iso(v):
@@ -578,6 +660,7 @@ def _fr(iso):
 def calcule_situation(base, bcs, seuil):
     colonnes = ["id", "Référence BC", "Client", "Chantier", "Période", "Montant BC (HT net)",
                 "Livré (HT net)", "Reste", "Dépassement", "% consommé", "Statut", "Qté livrée"]
+    qcol = next(iter(QTES), None)
     lignes = []
     for bc in bcs:
         sub = base[base["Client"] == bc["client"]]
@@ -606,7 +689,7 @@ def calcule_situation(base, bcs, seuil):
                        "Montant BC (HT net)": montant, "Livré (HT net)": livre,
                        "Reste": max(montant - livre, 0.0), "Dépassement": max(livre - montant, 0.0),
                        "% consommé": round(pct, 1), "Statut": statut,
-                       "Qté livrée": float(sub["Quantité"].sum()) if "Quantité" in sub.columns else None})
+                       "Qté livrée": float(sub[qcol].sum()) if qcol else None})
     return pd.DataFrame(lignes, columns=colonnes)
 
 
@@ -651,9 +734,8 @@ if est_admin:
         st.button("Créer l'utilisateur", type="primary", on_click=cb_ajoute)
 
         st.markdown("**💾 Sauvegarde des comptes**")
-        st.caption("Les comptes créés ici sont stockés sur le serveur : ils peuvent disparaître "
-                   "au redémarrage de l'application. Téléchargez une sauvegarde de temps en "
-                   "temps ; vous pourrez la restaurer en un clic.")
+        st.caption("Les comptes créés ici sont stockés dans Supabase (permanent). Vous pouvez "
+                   "tout de même télécharger une sauvegarde et la restaurer en un clic.")
         b1, b2 = st.columns(2)
         b1.download_button("⬇️ Télécharger la sauvegarde",
                            json.dumps(comptes_fichier(), ensure_ascii=False, indent=2),
@@ -679,56 +761,57 @@ if est_admin:
             st.session_state["cle"] += 1
             st.rerun()
 
-fichiers = liste_fichiers()
+data = charge_livraisons()
+fichiers = sorted(data["fichier"].unique()) if not data.empty else []
+st.sidebar.button("🔄 Actualiser les données", on_click=charge_livraisons.clear,
+                  help="Recharge les données depuis Supabase (utile si vous les avez modifiées "
+                       "directement dans Supabase).")
 
 if est_admin:
-    st.subheader("📁 Fichiers enregistrés sur la plateforme")
-    meta = charge_meta()
+    st.subheader("📁 Fichiers enregistrés dans la base")
     options_car = CARRIERES + [NON_CLASSEE]
 
     if fichiers:
-        classes = sorted(fichiers, key=lambda x: (carriere_de(x, meta), x))
-        for i, nom in enumerate(classes):
-            chemin = os.path.join(DOSSIER, nom)
-            c1, c2, c3, c4, c5 = st.columns([4.2, 1.5, 1.6, 1.7, 1.7])
-            c1.markdown(f"**📄 {nom}**  \n<small>{info_fichier(chemin)}</small>",
+        bilan = (data.groupby("fichier")
+                 .agg(carriere=("carriere", "first"), lignes=("id", "size"),
+                      montant=("montant_ht", "sum"), ajoute=("created_at", "min"))
+                 .reset_index().sort_values(["carriere", "fichier"]).reset_index(drop=True))
+        for i, r in bilan.iterrows():
+            nom, actuelle = r["fichier"], r["carriere"]
+            c1, c2, c3, c4 = st.columns([4.5, 1.6, 1.8, 1.8])
+            ajoute = r["ajoute"].strftime("%d/%m/%Y %H:%M") if pd.notna(r["ajoute"]) else "—"
+            nb = f"{int(r['lignes']):,}".replace(",", " ")
+            mt = f"{r['montant']:,.0f}".replace(",", " ")
+            c1.markdown(f"**📄 {nom}**  \n<small>{nb} lignes · {mt} Dh · ajouté le {ajoute}</small>",
                         unsafe_allow_html=True)
-            actuelle = carriere_de(nom, meta)
-            c2.selectbox("Carrière", options_car, index=options_car.index(actuelle),
-                         key=f"car_{i}_{nom}", label_visibility="collapsed",
-                         on_change=cb_carriere, args=(nom, f"car_{i}_{nom}"))
-            with open(chemin, "rb") as fh:
-                c3.download_button("⬇️ Télécharger", fh.read(), file_name=nom, key=f"dl_{i}")
+            opts = options_car if actuelle in options_car else options_car + [actuelle]
+            c2.selectbox("Carrière", opts, index=opts.index(actuelle), key=f"car_{i}_{nom}",
+                         label_visibility="collapsed", on_change=cb_carriere,
+                         args=(nom, f"car_{i}_{nom}"))
 
-            with c4.popover("✏️ Remplacer"):
+            with c3.popover("✏️ Remplacer"):
                 nouveau = st.file_uploader("Nouveau fichier Excel", type=TYPES, key=f"rep_{i}_{cle}")
                 if nouveau is not None and st.button("Confirmer le remplacement", key=f"okrep_{i}"):
                     nouveau_nom = nom_sur(nouveau.name)
+                    car = actuelle if actuelle in CARRIERES else detecte_carriere(nouveau_nom)
                     if nouveau_nom != nom and nouveau_nom in fichiers:
                         st.error("Un fichier portant ce nom existe déjà.")
+                    elif car is None:
+                        st.error("Choisissez d'abord la carrière de ce fichier dans la liste.")
                     else:
-                        with open(os.path.join(DOSSIER, nouveau_nom), "wb") as fh:
-                            fh.write(nouveau.getvalue())
-                        if nouveau_nom != nom:
-                            os.remove(chemin)
-                        m = charge_meta()
-                        car = carriere_de(nom, m)
-                        if car == NON_CLASSEE:
-                            car = detecte_carriere(nouveau_nom) or NON_CLASSEE
-                        m.pop(nom, None)
-                        m[nouveau_nom] = {"carriere": car, "ajoute": time.time()}
-                        sauve_meta(m)
-                        msg("success", f"« {nom} » a été remplacé par « {nouveau_nom} ».")
+                        with st.spinner("Import en cours…"):
+                            typ, texte = importer(nouveau.getvalue(), nouveau_nom, car,
+                                                  remplace_jours=True,
+                                                  ancien_nom=None if nom == SANS_FICHIER else nom)
+                        msg(typ, texte)
                         st.session_state["cle"] += 1
                         st.rerun()
 
-            with c5.popover("🗑️ Supprimer"):
-                st.write(f"Supprimer **{nom}** ?")
+            with c4.popover("🗑️ Supprimer"):
+                st.write(f"Supprimer **{nom}** et ses {nb} lignes ?")
                 if st.button("Oui, supprimer", key=f"del_{i}"):
-                    os.remove(chemin)
-                    m = charge_meta()
-                    m.pop(nom, None)
-                    sauve_meta(m)
+                    sb_ecrire("DELETE", TABLE, params=filtre_fichier(nom))
+                    charge_livraisons.clear()
                     msg("success", f"« {nom} » a été supprimé.")
                     st.session_state["cle"] += 1
                     st.rerun()
@@ -746,55 +829,38 @@ if est_admin:
                 det = detecte_carriere(up.name)
                 choix_car[j] = st.selectbox(up.name, opts, index=opts.index(det) if det else 0,
                                             key=f"carAdd_{cle}_{j}")
-        if ajouts and st.button("💾 Enregistrer sur la plateforme", type="primary"):
-            existants = {empreinte_fichier(os.path.join(DOSSIER, f)): f for f in liste_fichiers()}
-            m = charge_meta()
+        remplace_jours = st.checkbox(
+            "Remplacer les jours déjà présents pour la même carrière (recommandé)", value=True,
+            key=f"rj_{cle}",
+            help="Évite les doublons quand un rapport cumulé est réimporté : les anciennes lignes "
+                 "des mêmes jours (même carrière) sont remplacées par celles du nouveau fichier.")
+        avec_recap = st.checkbox("Inclure aussi les feuilles « récapitulatif / total / cumul »",
+                                 value=False, key=f"rc_{cle}")
+        if ajouts and st.button("💾 Enregistrer dans la base", type="primary"):
             for j, up in enumerate(ajouts):
-                car = choix_car.get(j)
-                contenu = up.getvalue()
-                nom_up = nom_sur(up.name)
-                h = empreinte_octets(contenu)
+                car, nom_up = choix_car.get(j), nom_sur(up.name)
                 if car not in CARRIERES:
                     msg("warning", f"« {up.name} » : choisissez sa carrière. Fichier non enregistré.")
-                elif h in existants:
-                    msg("warning", f"« {up.name} » est identique à « {existants[h]} » déjà "
-                                   f"enregistré : ignoré (pas de doublon).")
-                elif nom_up in existants.values():
+                elif nom_up in fichiers:
                     msg("warning", f"Un fichier nommé « {nom_up} » existe déjà : utilisez "
                                    f"« Remplacer » pour le mettre à jour.")
                 else:
-                    with open(os.path.join(DOSSIER, nom_up), "wb") as fh:
-                        fh.write(contenu)
-                    m[nom_up] = {"carriere": car, "ajoute": time.time()}
-                    existants[h] = nom_up
-                    msg("success", f"« {nom_up} » enregistré ({car}).")
-            sauve_meta(m)
+                    with st.spinner(f"Import de {nom_up}…"):
+                        typ, texte = importer(up.getvalue(), nom_up, car, remplace_jours,
+                                              None, avec_recap)
+                    msg(typ, texte)
             st.session_state["cle"] += 1
             st.rerun()
 
-    with st.expander("💾 Sauvegarde et restauration (fichiers + bons de commande)"):
-        st.caption("Les fichiers sont stockés sur le serveur : ils peuvent disparaître au "
-                   "redémarrage de l'application. Téléchargez une sauvegarde régulièrement ; "
-                   "elle contient aussi la carrière de chaque fichier.")
+    with st.expander("💾 Sauvegarde (livraisons + bons de commande)"):
+        st.caption("Les données sont stockées dans Supabase : elles ne disparaissent plus au "
+                   "redémarrage. Téléchargez tout de même une copie de temps en temps.")
         if fichiers and st.button("📦 Préparer la sauvegarde (ZIP)"):
             st.session_state["zip_pret"] = sauvegarde_zip()
         if st.session_state.get("zip_pret"):
             st.download_button("⬇ Télécharger la sauvegarde", st.session_state["zip_pret"],
                                file_name=f"sauvegarde_livraisons_{datetime.now():%Y-%m-%d}.zip",
                                mime="application/zip")
-        zipup = st.file_uploader("Restaurer depuis une sauvegarde (ZIP)", type=["zip"],
-                                 key=f"zip_{cle}")
-        if zipup is not None and st.button("Restaurer la sauvegarde"):
-            try:
-                nb, ign, nbc = restaure_zip(zipup.getvalue())
-                msg("success", f"{nb} fichier(s) restauré(s)"
-                               + (f", {nbc} bon(s) de commande" if nbc else "")
-                               + (f", {ign} déjà présent(s) ignoré(s)." if ign else "."))
-            except Exception:
-                msg("error", "Sauvegarde invalide.")
-            st.session_state["zip_pret"] = None
-            st.session_state["cle"] += 1
-            st.rerun()
 
 if not fichiers:
     if not est_admin:
@@ -804,157 +870,55 @@ if not fichiers:
 st.divider()
 
 # =====================================================================
-# 2) CHOIX DES FICHIERS / FEUILLES À ANALYSER
+# 2) CHOIX DES FICHIERS À ANALYSER ET PRÉPARATION DES DONNÉES
 # =====================================================================
-avance = st.sidebar.expander("⚙️ Fichiers et feuilles utilisés (avancé)")
+avance = st.sidebar.expander("⚙️ Fichiers utilisés (avancé)")
 sel_fichiers = avance.multiselect("Fichiers à analyser", fichiers, default=fichiers)
-remplacer = avance.checkbox(
-    "Un fichier plus récent remplace les mêmes jours (même carrière)", value=True,
-    help="Pour une carrière, si un jour apparaît dans plusieurs fichiers (ex. rapport cumulé "
-         "mis à jour chaque jour), seul le fichier enregistré en dernier est compté pour ce "
-         "jour : pas de double comptage.")
-meta_all = charge_meta()
 if not sel_fichiers:
     st.warning("Sélectionnez au moins un fichier dans la barre latérale.")
     st.stop()
 
-feuilles = {}
-defaut, ignorees, vus = [], [], {}
-for fch in sel_fichiers:
-    chemin = os.path.join(DOSSIER, fch)
-    try:
-        classeur = lire_classeur(chemin, os.path.getmtime(chemin))
-    except Exception as e:
-        st.error(f"Impossible de lire « {fch} » : {e}")
-        continue
-    for feuille, d in classeur.items():
-        label = f"{fch} › {feuille}"
-        feuilles[label] = (fch, feuille, d)
-        if d.empty:
-            ignorees.append(f"{label} (vide)")
-        elif any(m in feuille.lower() for m in MOTS_RECAP):
-            ignorees.append(f"{label} (récapitulatif)")
-        else:
-            h = (carriere_de(fch, meta_all), empreinte_df(d))
-            if h in vus:
-                ignorees.append(f"{label} (identique à « {vus[h]} »)")
-            else:
-                vus[h] = label
-                defaut.append(label)
+brut = data[data["fichier"].isin(sel_fichiers)]
+dj = pd.to_datetime(brut["date_livraison"], errors="coerce")
+df = pd.DataFrame({
+    "Carrière": brut["carriere"],
+    "Fichier": brut["fichier"],
+    "Feuille": brut["feuille"].fillna(""),
+    "Jour": dj.dt.strftime("%Y-%m-%d"),
+    "Mois": dj.dt.strftime("%Y-%m"),
+    "Client": texte_propre(brut["client"]),
+    "Produit": texte_propre(brut["produit"]),
+    "Chantier": texte_propre(brut["chantier"]),
+    "Quantité (T)": brut["qte_tonnes"].fillna(0),
+    "Quantité (m³)": brut["qte_m3"].fillna(0),
+    "Montant HT Net": brut["montant_ht"].fillna(0),
+})
+sans_date = df[df["Jour"].isna()].copy()
+df = df[df["Jour"].notna()].copy()
 
-if not feuilles:
-    st.stop()
-
-choisies = avance.multiselect("Feuilles incluses dans le calcul", list(feuilles), default=defaut)
-if ignorees:
-    with st.sidebar.expander(f"⚠️ {len(ignorees)} feuille(s) ignorée(s) par défaut"):
-        st.caption("Récapitulatifs, feuilles vides ou identiques à une autre feuille : "
-                   "elles feraient doubler les totaux. Ajoutez-les à la liste ci-dessus "
-                   "si vous en avez besoin.")
-        st.write("\n".join(f"- {x}" for x in ignorees))
-if not choisies:
-    st.warning("Sélectionnez au moins une feuille.")
-    st.stop()
-
-df = pd.concat([feuilles[l][2].assign(Fichier=feuilles[l][0], Feuille=feuilles[l][1],
-                                      **{"Carrière": carriere_de(feuilles[l][0], meta_all)})
-                for l in choisies], ignore_index=True)
-cols = [c for c in df.columns if c not in ("Fichier", "Feuille", "Carrière")]
-
-
-# ---------- Détection automatique des colonnes ----------
-def devine(mots):
-    for m in mots:
-        for c in cols:
-            if m in c.lower():
-                return c
-    return None
-
-
-def colonne(label, mots, requis=False):
-    d = devine(mots)
-    if d is None and requis:
-        d = st.sidebar.selectbox(f"{label} (non détectée, à choisir)", [None] + cols,
-                                 format_func=lambda x: "— choisir —" if x is None else x)
-    return d
-
-
-c_client = colonne("Client", ["client", "société", "societe", "raison", "destinataire",
-                              "tiers", "chantier"], requis=True)
-c_produit = colonne("Produit", ["produit", "désignation", "designation", "article", "matière",
-                                "matiere", "nature"], requis=True)
-c_date = colonne("Date", ["date"], requis=True)
-c_qte = colonne("Quantité", ["qté en t", "qte en t", "tonnage", "quant", "qté", "qte", "poids"])
-c_pu = colonne("Prix unitaire", ["p.u ht", "p.u", "prix", "pu"])
-c_net = colonne("Montant HT Net", ["montant ht net", "ht net", "net ht", "montant ht",
-                                   "total ht", "montant"])
-c_chantier = colonne("Chantier", ["chantier", "destination", "lieu"])
-if c_chantier is None:
-    with st.sidebar.expander("🏗️ Colonne Chantier (non détectée)"):
-        c_chantier = st.selectbox("Choisir la colonne Chantier", [None] + cols,
-                                  format_func=lambda x: "— aucune —" if x is None else x)
-
-if c_client is None or c_produit is None or c_date is None:
-    st.warning("Certaines colonnes n'ont pas été détectées : choisissez-les dans la barre "
-               "latérale. Voici les premières lignes lues :")
-    st.dataframe(df.head(15), use_container_width=True)
-    st.stop()
-
-# ---------- Montant HT Net ----------
-if c_net:
-    df["Montant HT Net"] = to_num(df[c_net])
-elif c_qte and c_pu:
-    df["Montant HT Net"] = to_num(df[c_qte]) * to_num(df[c_pu])
-else:
-    st.error("Colonne « Montant HT » introuvable (ni Quantité + Prix unitaire). "
-             "Vérifiez les noms de colonnes de votre fichier.")
-    st.dataframe(df.head(15), use_container_width=True)
-    st.stop()
-df["Montant HT Net"] = df["Montant HT Net"].fillna(0)
-
-# ---------- Nettoyage ----------
-df["Client"] = texte_propre(df[c_client])
-df["Produit"] = texte_propre(df[c_produit])
 c_client, c_produit = "Client", "Produit"
 df = df[~df[c_client].str.lower().isin(["", "nan", "none"])]
 masque_total = (df[c_client].str.lower().str.contains("total")
                 | df[c_produit].str.lower().str.contains("total"))
-df = df[~masque_total]
-
-if c_chantier:
-    ch = texte_propre(df[c_chantier])
-    df["Chantier"] = ch.where(~ch.str.lower().isin(["", "nan", "none", "nat"]), "(non renseigné)")
-
-if c_qte:
-    df["Quantité"] = to_num(df[c_qte]).fillna(0)
-
-# ---------- Mois (à partir de la colonne date) ----------
-d = pd.to_datetime(df[c_date], errors="coerce", dayfirst=True)
-valide = d.notna()
-sans_date = df.loc[~valide].copy()
-df = df.loc[valide].copy()
-df["Mois"] = d.loc[valide].dt.strftime("%Y-%m")
-df["Jour"] = d.loc[valide].dt.strftime("%Y-%m-%d")
-
-# ---------- Consolidation ----------
+df = df[~masque_total].copy()
+df["Chantier"] = df["Chantier"].where(~df["Chantier"].str.lower().isin(["", "nan", "none", "nat"]),
+                                      "(non renseigné)")
+c_chantier = "Chantier" if (df["Chantier"] != "(non renseigné)").any() else None
+QTES = [q for q in ("Quantité (T)", "Quantité (m³)") if df[q].ne(0).any()]
+UNITES = {"Quantité (T)": "T", "Quantité (m³)": "m³"}
+c_qte = bool(QTES)
 n_remplacees = 0
-if remplacer and len(sel_fichiers) > 1:
-    ordre = sorted(sel_fichiers, key=lambda x: (date_ajout(x, meta_all), x))
-    df["_rang"] = df["Fichier"].map({fch: i for i, fch in enumerate(ordre)})
-    dernier = df.groupby(["Carrière", "Jour"])["_rang"].transform("max")
-    n_remplacees = int((df["_rang"] != dernier).sum())
-    df = df[df["_rang"] == dernier].drop(columns="_rang")
 
 if df.empty:
-    st.warning("Aucune ligne exploitable après nettoyage. Vérifiez le fichier.")
+    st.warning("Aucune ligne exploitable. Vérifiez les fichiers importés.")
     st.stop()
 
 # ---------- Lignes en double ----------
-colonnes_source = [c for c in cols if c in df.columns] + ["Carrière"]
+colonnes_source = [c for c in df.columns if c not in ("Fichier", "Feuille")]
 n_dup = int(df.duplicated(subset=colonnes_source).sum())
 retirer = False
 if n_dup:
-    st.sidebar.warning(f"{n_dup} ligne(s) strictly identique(s) détectée(s).")
+    st.sidebar.warning(f"{n_dup} ligne(s) strictement identique(s) détectée(s).")
     retirer = st.sidebar.checkbox("Ignorer ces lignes en double", value=False,
                                   help="Attention : deux livraisons réelles parfaitement "
                                        "identiques seraient aussi retirées.")
@@ -964,8 +928,8 @@ if retirer:
 # ---------- Vérification des totaux ----------
 with st.expander("🔎 Vérification des totaux par carrière, fichier, feuille et mois"):
     agg = {"Lignes": ("Montant HT Net", "size"), "Montant_HT_Net": ("Montant HT Net", "sum")}
-    if c_qte:
-        agg["Quantité"] = ("Quantité", "sum")
+    for q in QTES:
+        agg[q] = (q, "sum")
     verif = df.groupby(["Carrière", "Fichier", "Feuille", "Mois"]).agg(**agg).reset_index()
     st.dataframe(verif, use_container_width=True)
     if n_remplacees:
@@ -1058,22 +1022,21 @@ k1, k2, k3, k4 = st.columns(4)
 k1.metric("Montant HT Net total", fmt(f["Montant HT Net"].sum()))
 k2.metric("Nb de lignes", f"{len(f):,}".replace(",", " "))
 k3.metric("Nb de clients", f[c_client].nunique())
-if c_qte:
-    k4.metric("Quantité totale", fmt(f["Quantité"].sum()))
+if QTES:
+    k4.metric("Quantité totale", " · ".join(f"{fmt(f[q].sum())} {UNITES[q]}" for q in QTES))
 
 # ---------- Onglets & Génération des tableaux ----------
 MONTANT = "Montant HT Net"
-QTE = "Quantité (m³)" if (c_qte and "m3" in c_qte.lower().replace("³", "3")) else "Quantité (T)"
-indicateurs = [MONTANT] + ([QTE] if c_qte else [])
+indicateurs = [MONTANT] + QTES
 ind = (st.radio("Indicateur affiché dans les graphiques et tableaux croisés", indicateurs,
-                horizontal=True) if c_qte else MONTANT)
-col_ind = "Quantité" if ind == QTE else "Montant HT Net"
+                horizontal=True) if len(indicateurs) > 1 else MONTANT)
+col_ind = ind if ind in QTES else "Montant HT Net"
 
 
 def resume(cle):
     agg = {MONTANT: ("Montant HT Net", "sum")}
-    if c_qte:
-        agg[QTE] = ("Quantité", "sum")
+    for q in QTES:
+        agg[q] = (q, "sum")
     agg["Livraisons"] = ("Montant HT Net", "size")
     return f.groupby(cle, as_index=False).agg(**agg)
 
