@@ -9,6 +9,7 @@ import time
 import zipfile
 from datetime import datetime
 
+import base64
 import pandas as pd
 import requests
 import streamlit as st
@@ -35,14 +36,31 @@ COLS_LIV = ("id,carriere,date_livraison,client,produit,qte_tonnes,qte_m3,montant
 SANS_FICHIER = "(sans fichier)"
 
 
+def _role_cle(cle):
+    """Rôle contenu dans une clé JWT (anon / service_role), ou None si illisible."""
+    try:
+        p = cle.split(".")[1]
+        return json.loads(base64.urlsafe_b64decode(p + "=" * (-len(p) % 4))).get("role")
+    except Exception:
+        return None
+
+
 def _config():
     try:
         s = st.secrets["supabase"]
-        return s["url"].rstrip("/") + "/rest/v1", s["key"]
+        url, cle = s["url"].strip().rstrip("/"), s["key"].strip()
     except Exception:
         st.error("Configuration Supabase manquante : ajoutez la section [supabase] "
                  "(url, key) dans les Secrets de l'application.")
         st.stop()
+    if url.endswith("/rest/v1"):
+        url = url[: -len("/rest/v1")]
+    if cle.startswith("sb_publishable") or _role_cle(cle) == "anon":
+        st.error("⚠️ La clé indiquée dans les Secrets est la clé PUBLIQUE (anon / publishable). "
+                 "Le RLS la bloque. Dans Supabase > Project Settings > API Keys, copiez la clé "
+                 "SECRÈTE (« sb_secret_… » ou « service_role ») et remplacez-la dans les Secrets.")
+        st.stop()
+    return url + "/rest/v1", cle
 
 
 def _entetes(extra=None):
