@@ -15,8 +15,26 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Suivi livraisons carrières", page_icon="🚚", layout="wide")
-st.title("🚚 Suivi des livraisons – Matériaux de carrière")
+# Logo Granal : fichier « logo.jpg » placé à côté de app.py
+LOGO = next((f for f in (Path(__file__).resolve().parent / "logo.jpg",
+                         Path(__file__).resolve().parent / "logo.jpeg",
+                         Path(__file__).resolve().parent / "logo.png") if f.exists()), None)
+try:
+    from PIL import Image
+    _icone = Image.open(LOGO) if LOGO else "🚚"
+except Exception:
+    _icone = "🚚"
+
+st.set_page_config(page_title="Suivi livraisons carrières", page_icon=_icone, layout="wide")
+if LOGO:
+    try:
+        _c_logo, _c_titre = st.columns([1, 9], vertical_alignment="center")
+    except TypeError:  # anciennes versions de Streamlit
+        _c_logo, _c_titre = st.columns([1, 9])
+    _c_logo.image(str(LOGO), width=110)
+    _c_titre.title("Suivi des livraisons – Matériaux de carrière")
+else:
+    st.title("🚚 Suivi des livraisons – Matériaux de carrière")
 
 TYPES = ["xlsx", "xlsm", "xls"]
 
