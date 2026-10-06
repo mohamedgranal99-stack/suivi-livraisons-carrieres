@@ -1075,7 +1075,7 @@ chantiers = (st.sidebar.multiselect("Chantier", options_possibles("f_chantier"),
              if c_chantier else [])
 
 mn, mx = float(df["Montant HT Net"].min()), float(df["Montant HT Net"].max())
-plage = st.sidebar.slider("Montant HT Net (par ligne)", mn, mx, (mn, mx)) if mn < mx else (mn, mx)
+plage = st.sidebar.slider("Montant HT (par ligne)", mn, mx, (mn, mx)) if mn < mx else (mn, mx)
 
 f = df.copy()
 if carrieres:
@@ -1133,14 +1133,14 @@ if not sp.empty:
 
 # ---------- Indicateurs ----------
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Montant HT Net total", fmt(f["Montant HT Net"].sum()))
+k1.metric("Montant HT total", fmt(f["Montant HT Net"].sum()))
 k2.metric("Nb de lignes", f"{len(f):,}".replace(",", " "))
 k3.metric("Nb de clients", f[c_client].nunique())
 if QTES:
     k4.metric("Quantité totale", " · ".join(f"{fmt(f[q].sum())} {UNITES[q]}" for q in QTES))
 
 # ---------- Onglets & Génération des tableaux ----------
-MONTANT = "Montant HT Net"
+MONTANT = "Montant HT"
 indicateurs = [MONTANT] + QTES
 ind = (st.radio("Indicateur affiché dans les graphiques et tableaux croisés", indicateurs,
                 horizontal=True) if len(indicateurs) > 1 else MONTANT)
@@ -1341,7 +1341,7 @@ with onglets["📑 Bons de commande"]:
                               args=(bid,))
 
 with onglets["💰 Plafond par client"]:
-    st.caption("Fixez un montant plafond (HT) par client : il est comparé au Montant HT Net livré "
+    st.caption("Fixez un montant plafond (HT) par client : il est comparé au Montant HT livré "
                "au client, selon les filtres sélectionnés, sur toute la période ou sur une période "
                "limitée (du … au …). Le seuil d'alerte est celui de "
                "l'onglet « Bons de commande ».")
@@ -1391,7 +1391,7 @@ with onglets["💰 Plafond par client"]:
                 st.button("Supprimer ce plafond", on_click=cb_pl_supprime, args=(cible,))
 
 with onglets["📋 Détail"]:
-    st.dataframe(f, use_container_width=True)
+    st.dataframe(f.rename(columns={"Montant HT Net": "Montant HT"}), use_container_width=True)
 
 # =====================================================================
 # 3) EXPORT EXCEL COMPLET (CONFORME AUX TABLEAUX ET IMPRIMABLE EN A4 PAYSAGE)
