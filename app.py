@@ -7,6 +7,7 @@ import re
 import secrets as pysecrets
 import time
 import zipfile
+from pathlib import Path
 from datetime import datetime
 
 import base64
@@ -313,6 +314,19 @@ def cb_mon_mdp():
             ss[k] = ""
 
 
+def page_garde():
+    """Affiche la photo de page de garde (fichier placé à côté de app.py)."""
+    dossier = Path(__file__).resolve().parent
+    img = dossier / "page de garde Granal.jpg"
+    if not img.exists():  # tolère une autre casse ou extension
+        img = next((f for f in sorted(dossier.iterdir())
+                    if "garde" in f.name.lower()
+                    and f.suffix.lower() in (".jpg", ".jpeg", ".png")), None)
+    if img is not None:
+        _, centre, _ = st.columns([1, 3, 1])
+        centre.image(str(img), use_container_width=True)
+
+
 def connexion():
     comptes = tous_comptes()
 
@@ -334,6 +348,7 @@ def connexion():
         st.code(EXEMPLE_SECRETS, language="toml")
         st.stop()
 
+    page_garde()
     st.subheader("🔐 Connexion")
     with st.form("login"):
         login = st.text_input("Identifiant")
