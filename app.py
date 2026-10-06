@@ -31,8 +31,19 @@ st.session_state.setdefault("cle", 0)
 # BASE DE DONNÉES SUPABASE (stockage permanent)
 # =====================================================================
 TABLE = "livraisons_carrieres"
-COLS_LIV = ("id,carriere,date_livraison,client,produit,qte_tonnes,qte_m3,montant_ht,chantier,"
-            "fichier,feuille,created_at")
+COLS_LIV_BASE = ("id,carriere,date_livraison,client,produit,qte_tonnes,qte_m3,montant_ht,chantier,"
+                 "fichier,feuille,created_at")
+SQL_COL_HT = "alter table livraisons_carrieres add column montant_ht_brut numeric;"
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def col_ht_existe():
+    """True si la colonne montant_ht_brut (Montant HT avant remise) existe dans Supabase."""
+    try:
+        sb_lire(TABLE, {"select": "montant_ht_brut", "limit": "1"})
+        return True
+    except Exception:
+        return False
 SANS_FICHIER = "(sans fichier)"
 
 
@@ -117,9 +128,11 @@ def kv_set(cle, valeur):
 
 @st.cache_data(ttl=3600, show_spinner="Chargement des livraisons…")
 def charge_livraisons():
-    d = pd.DataFrame(sb_lire(TABLE, {"select": COLS_LIV, "order": "id"}),
-                     columns=COLS_LIV.split(","))
-    for c in ("qte_tonnes", "qte_m3", "montant_ht"):
+    cols = COLS_LIV_BASE + (",montant_ht_brut" if col_ht_existe() else "")
+    d = pd.DataFrame(sb_lire(TABLE, {"select": cols, "order": "id"}), columns=cols.split(","))
+    if "montant_ht_brut" not in d.columns:
+        d["montant_ht_brut"] = float("nan")
+    for c in ("qte_tonnes", "qte_m3", "montant_ht", "montant_ht_brut"):
         d[c] = pd.to_numeric(d[c], errors="coerce")
     d["created_at"] = pd.to_datetime(d["created_at"], errors="coerce", utc=True)
     d["fichier"] = d["fichier"].where(d["fichier"].notna() & (d["fichier"] != ""), SANS_FICHIER)
@@ -449,6 +462,10 @@ def transforme_feuille(d, car, nom, feuille):
     c_net = devine_col(cols, ["montant ht net", "ht net", "net ht", "montant ht", "total ht",
                               "montant"])
     c_chantier = devine_col(cols, ["chantier", "destination", "lieu"])
+    # « Montant HT » avant remise : colonne HT qui n'est pas la colonne Net
+    c_brut = next((c for c in cols if c != c_net and "net" not in c.lower()
+                   and any(m in c.lower() for m in ("montant ht", "total ht", "montant h.t",
+                                                    "ht brut", "brut"))), None)
     manque = [n for n, c in (("Client", c_client), ("Produit", c_produit), ("Date", c_date))
               if c is None]
     if manque:
@@ -484,6 +501,9 @@ def transforme_feuille(d, car, nom, feuille):
     out["qte_tonnes"] = qte if (qte is not None and not en_m3) else float("nan")
     out["qte_m3"] = qte if (qte is not None and en_m3) else float("nan")
     out["montant_ht"] = montant[garde].fillna(0).round(4).to_numpy()
+    # sans colonne HT distincte dans la feuille, le Montant HT est le même que le Net
+    out["montant_ht_brut"] = (to_num(d[c_brut])[garde].fillna(0).round(4).to_numpy()
+                              if c_brut else out["montant_ht"].to_numpy())
     if c_chantier:
         ch = texte_propre(d[c_chantier])[garde]
         out["chantier"] = ch.where(~ch.str.lower().isin(["", "nan", "none", "nat"]), None).to_numpy()
@@ -541,6 +561,8 @@ def importer(contenu, nom, car, remplace_jours=True, ancien_nom=None, avec_recap
             a_suppr.update(int(i) for i in m["id"])
         if ancien_nom:
             a_suppr.update(int(i) for i in existant.loc[existant["fichier"] == ancien_nom, "id"])
+        if not col_ht_existe():
+            rows = rows.drop(columns=["montant_ht_brut"], errors="ignore")
         enregistrements = json.loads(rows.to_json(orient="records", force_ascii=False))
         for i in range(0, len(enregistrements), 500):
             sb_ecrire("POST", TABLE, json_=enregistrements[i:i + 500])
@@ -988,8 +1010,10 @@ df = pd.DataFrame({
     "Chantier": texte_propre(brut["chantier"]),
     "Quantité (T)": brut["qte_tonnes"].fillna(0),
     "Quantité (m³)": brut["qte_m3"].fillna(0),
+    "Montant HT": brut["montant_ht_brut"].fillna(0),
     "Montant HT Net": brut["montant_ht"].fillna(0),
 })
+HT_DISPO = bool(df["Montant HT"].ne(0).any())
 sans_date = df[df["Jour"].isna()].copy()
 df = df[df["Jour"].notna()].copy()
 
@@ -1075,7 +1099,7 @@ chantiers = (st.sidebar.multiselect("Chantier", options_possibles("f_chantier"),
              if c_chantier else [])
 
 mn, mx = float(df["Montant HT Net"].min()), float(df["Montant HT Net"].max())
-plage = st.sidebar.slider("Montant HT (par ligne)", mn, mx, (mn, mx)) if mn < mx else (mn, mx)
+plage = st.sidebar.slider("Montant HT Net (par ligne)", mn, mx, (mn, mx)) if mn < mx else (mn, mx)
 
 f = df.copy()
 if carrieres:
@@ -1132,23 +1156,34 @@ if not sp.empty:
             f"{r['Client']} {r['% consommé']:.0f} %" for _, r in pro_pl.iterrows()))
 
 # ---------- Indicateurs ----------
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Montant HT total", fmt(f["Montant HT Net"].sum()))
-k2.metric("Nb de lignes", f"{len(f):,}".replace(",", " "))
-k3.metric("Nb de clients", f[c_client].nunique())
+kpis = []
+if HT_DISPO:
+    kpis.append(("Montant HT total", fmt(f["Montant HT"].sum())))
+kpis.append(("Montant HT Net total", fmt(f["Montant HT Net"].sum())))
+kpis.append(("Nb de lignes", f"{len(f):,}".replace(",", " ")))
+kpis.append(("Nb de clients", f[c_client].nunique()))
 if QTES:
-    k4.metric("Quantité totale", " · ".join(f"{fmt(f[q].sum())} {UNITES[q]}" for q in QTES))
+    kpis.append(("Quantité totale", " · ".join(f"{fmt(f[q].sum())} {UNITES[q]}" for q in QTES)))
+for col_k, (lib, val) in zip(st.columns(len(kpis)), kpis):
+    col_k.metric(lib, val)
+if not col_ht_existe():
+    st.info("ℹ️ Pour afficher le **Montant HT** (avant remise), ajoutez la colonne dans Supabase "
+            f"(SQL Editor) : `{SQL_COL_HT}` puis ré-importez vos fichiers.")
+elif not HT_DISPO:
+    st.info("ℹ️ Le **Montant HT** n'est pas encore enregistré : ré-importez vos fichiers Excel.")
 
 # ---------- Onglets & Génération des tableaux ----------
-MONTANT = "Montant HT"
-indicateurs = [MONTANT] + QTES
+MONTANT = "Montant HT Net"
+HT = "Montant HT"
+indicateurs = ([HT] if HT_DISPO else []) + [MONTANT] + QTES
 ind = (st.radio("Indicateur affiché dans les graphiques et tableaux croisés", indicateurs,
                 horizontal=True) if len(indicateurs) > 1 else MONTANT)
-col_ind = ind if ind in QTES else "Montant HT Net"
+col_ind = ind if (ind in QTES or ind == HT) else "Montant HT Net"
 
 
 def resume(cle):
-    agg = {MONTANT: ("Montant HT Net", "sum")}
+    agg = {HT: (HT, "sum")} if HT_DISPO else {}
+    agg[MONTANT] = ("Montant HT Net", "sum")
     for q in QTES:
         agg[q] = (q, "sum")
     agg["Livraisons"] = ("Montant HT Net", "size")
@@ -1341,7 +1376,7 @@ with onglets["📑 Bons de commande"]:
                               args=(bid,))
 
 with onglets["💰 Plafond par client"]:
-    st.caption("Fixez un montant plafond (HT) par client : il est comparé au Montant HT livré "
+    st.caption("Fixez un montant plafond (HT) par client : il est comparé au Montant HT Net livré "
                "au client, selon les filtres sélectionnés, sur toute la période ou sur une période "
                "limitée (du … au …). Le seuil d'alerte est celui de "
                "l'onglet « Bons de commande ».")
@@ -1391,7 +1426,7 @@ with onglets["💰 Plafond par client"]:
                 st.button("Supprimer ce plafond", on_click=cb_pl_supprime, args=(cible,))
 
 with onglets["📋 Détail"]:
-    st.dataframe(f.rename(columns={"Montant HT Net": "Montant HT"}), use_container_width=True)
+    st.dataframe(f, use_container_width=True)
 
 # =====================================================================
 # 3) EXPORT EXCEL COMPLET (CONFORME AUX TABLEAUX ET IMPRIMABLE EN A4 PAYSAGE)
