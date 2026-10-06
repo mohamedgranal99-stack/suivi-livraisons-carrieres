@@ -735,13 +735,18 @@ def cb_pl_enregistre():
     ss = st.session_state
     client = ss.get("pl_client")
     montant = float(ss.get(f"pl_montant_{client}") or 0)
+    periode = bool(ss.get(f"pl_periode_{client}"))
+    d1, d2 = ((ss.get(f"pl_d1_{client}"), ss.get(f"pl_d2_{client}")) if periode else (None, None))
     if not client:
         msg("error", "Choisissez le client.")
     elif montant <= 0:
         msg("error", "Le montant plafond doit être supérieur à 0.")
+    elif periode and d1 and d2 and d1 > d2:
+        msg("error", "La date de début doit précéder la date de fin.")
     else:
         d = charge_plafonds()
         d[client] = {"montant": montant, "note": (ss.get(f"pl_note_{client}") or "").strip(),
+                     "date_debut": date_iso(d1), "date_fin": date_iso(d2),
                      "maj_par": moi() or "", "maj_le": datetime.now().isoformat(timespec="seconds")}
         kv_set("plafonds", d)
         msg("success", f"Plafond de « {client} » enregistré.")
@@ -756,12 +761,20 @@ def cb_pl_supprime(client):
 
 
 def situation_plafonds(base, plafonds, seuil):
-    colonnes = ["Client", "Plafond (HT)", "Livré (HT)", "Reste", "Dépassement", "% consommé",
-                "Statut", "Note"]
+    colonnes = ["Client", "Période", "Plafond (HT)", "Livré (HT)", "Reste", "Dépassement",
+                "% consommé", "Statut", "Note"]
     lignes = []
     for client, p in plafonds.items():
         plafond = float(p.get("montant", 0))
-        livre = float(base.loc[base["Client"] == client, "Montant HT Net"].sum())
+        sub = base[base["Client"] == client]
+        d1, d2 = p.get("date_debut"), p.get("date_fin")
+        if d1:
+            sub = sub[sub["Jour"] >= d1]
+        if d2:
+            sub = sub[sub["Jour"] <= d2]
+        livre = float(sub["Montant HT Net"].sum())
+        periode = ("toute la période" if not (d1 or d2) else
+                   f"{_fr(d1) if d1 else '…'} → {_fr(d2) if d2 else '…'}")
         pct = livre / plafond * 100 if plafond > 0 else 0.0
         if round(livre, 2) >= round(plafond, 2):
             statut = STATUT_DEPASSE
@@ -769,7 +782,8 @@ def situation_plafonds(base, plafonds, seuil):
             statut = STATUT_PROCHE
         else:
             statut = STATUT_OK
-        lignes.append({"Client": client, "Plafond (HT)": plafond, "Livré (HT)": livre,
+        lignes.append({"Client": client, "Période": periode, "Plafond (HT)": plafond,
+                       "Livré (HT)": livre,
                        "Reste": max(plafond - livre, 0.0), "Dépassement": max(livre - plafond, 0.0),
                        "% consommé": round(pct, 1), "Statut": statut, "Note": p.get("note", "")})
     return pd.DataFrame(lignes, columns=colonnes)
@@ -967,6 +981,7 @@ df = pd.DataFrame({
     "Fichier": brut["fichier"],
     "Feuille": brut["feuille"].fillna(""),
     "Jour": dj.dt.strftime("%Y-%m-%d"),
+    "Année": dj.dt.strftime("%Y"),
     "Mois": dj.dt.strftime("%Y-%m"),
     "Client": texte_propre(brut["client"]),
     "Produit": texte_propre(brut["produit"]),
@@ -1023,7 +1038,7 @@ with st.expander("🔎 Vérification des totaux par carrière, fichier, feuille 
         st.dataframe(sans_date, use_container_width=True)
 
 # ---------- Filtres (liés entre eux) ----------
-FILTRES = {"f_carriere": "Carrière", "f_mois": "Mois", "f_client": c_client,
+FILTRES = {"f_carriere": "Carrière", "f_annee": "Année", "f_mois": "Mois", "f_client": c_client,
            "f_produit": c_produit}
 if c_chantier:
     FILTRES["f_chantier"] = "Chantier"
@@ -1052,6 +1067,7 @@ def cb_reset_filtres():
 st.sidebar.subheader("Filtres")
 st.sidebar.button("↺ Réinitialiser les filtres", on_click=cb_reset_filtres)
 carrieres = st.sidebar.multiselect("Carrière", options_possibles("f_carriere"), key="f_carriere")
+annees = st.sidebar.multiselect("Année", options_possibles("f_annee"), key="f_annee")
 mois = st.sidebar.multiselect("Mois", options_possibles("f_mois"), key="f_mois")
 clients = st.sidebar.multiselect("Client", options_possibles("f_client"), key="f_client")
 produits = st.sidebar.multiselect("Produit", options_possibles("f_produit"), key="f_produit")
@@ -1064,6 +1080,8 @@ plage = st.sidebar.slider("Montant HT Net (par ligne)", mn, mx, (mn, mx)) if mn 
 f = df.copy()
 if carrieres:
     f = f[f["Carrière"].isin(carrieres)]
+if annees:
+    f = f[f["Année"].isin(annees)]
 if mois:
     f = f[f["Mois"].isin(mois)]
 if clients:
@@ -1088,6 +1106,7 @@ sit = calcule_situation(f, bcs, seuil_alerte)
 pl = charge_plafonds()
 sp = situation_plafonds(f, pl, seuil_alerte)
 n_rouge = n_jaune = 0
+n_rouge_pl = n_jaune_pl = 0
 if not sit.empty:
     depasses = sit[sit["Statut"] == STATUT_DEPASSE]
     proches = sit[sit["Statut"] == STATUT_PROCHE]
@@ -1100,6 +1119,17 @@ if not sit.empty:
         st.warning(f"🟡 **Bon(s) de commande à {seuil_alerte} % ou plus** : " + " · ".join(
             f"{r['Référence BC']} ({r['Client']}) {r['% consommé']:.0f} %"
             for _, r in proches.iterrows()))
+
+if not sp.empty:
+    dep_pl = sp[sp["Statut"] == STATUT_DEPASSE]
+    pro_pl = sp[sp["Statut"] == STATUT_PROCHE]
+    n_rouge_pl, n_jaune_pl = len(dep_pl), len(pro_pl)
+    if n_rouge_pl:
+        st.error("🔴 **Plafond(s) client atteint(s) ou dépassé(s)** : " + " · ".join(
+            f"{r['Client']} {r['% consommé']:.0f} %" for _, r in dep_pl.iterrows()))
+    if n_jaune_pl:
+        st.warning(f"🟡 **Plafond(s) client à {seuil_alerte} % ou plus** : " + " · ".join(
+            f"{r['Client']} {r['% consommé']:.0f} %" for _, r in pro_pl.iterrows()))
 
 # ---------- Indicateurs ----------
 k1, k2, k3, k4 = st.columns(4)
@@ -1147,7 +1177,8 @@ def afficher(cle, croise=None):
         st.dataframe(df_croise, use_container_width=True)
 
 
-TAB_ALERTES = f"🚨 Alertes ({n_rouge + n_jaune})" if (n_rouge + n_jaune) else "🚨 Alertes"
+n_alertes = n_rouge + n_jaune + n_rouge_pl + n_jaune_pl
+TAB_ALERTES = f"🚨 Alertes ({n_alertes})" if n_alertes else "🚨 Alertes"
 noms_onglets = [TAB_ALERTES, "📅 Par mois", "📆 Par jour", "🏭 Par carrière", "👥 Par client",
                 "🪨 Par produit"]
 if c_chantier:
@@ -1158,23 +1189,44 @@ noms_onglets.append("📋 Détail")
 onglets = dict(zip(noms_onglets, st.tabs(noms_onglets)))
 
 with onglets[TAB_ALERTES]:
-    st.caption(f"🟡 **Jaune** : bon consommé à {seuil_alerte} % ou plus · 🔴 **Rouge** : 100 % atteint "
-               f"ou dépassé. Le seuil jaune se règle dans l'onglet « Bons de commande ».")
-    if sit.empty:
-        st.info("Aucun bon de commande enregistré ou correspondant à la sélection.")
-    else:
-        al1, al2, al3 = st.columns(3)
-        al1.metric("🔴 À 100 % ou plus", n_rouge)
-        al2.metric("🟡 Au seuil d'alerte", n_jaune)
-        al3.metric("Dépassement total (Dh)", fmt(sit.loc[sit["Statut"] != STATUT_CLOS, "Dépassement"].sum()))
-        alertes = (sit[sit["Statut"].isin([STATUT_DEPASSE, STATUT_PROCHE])]
-                   .sort_values("% consommé", ascending=False))
-        if alertes.empty:
-            st.success(f"✅ Aucun bon de commande n'a atteint {seuil_alerte} %.")
+    type_alerte = st.radio("Alertes par rapport à", ["📑 Bons de commande", "💰 Plafond par client"],
+                           horizontal=True, key="type_alerte")
+    if type_alerte.startswith("📑"):
+        st.caption(f"🟡 **Jaune** : bon consommé à {seuil_alerte} % ou plus · 🔴 **Rouge** : 100 % "
+                   f"atteint ou dépassé. Le seuil jaune se règle dans l'onglet « Bons de commande ».")
+        if sit.empty:
+            st.info("Aucun bon de commande enregistré ou correspondant à la sélection.")
         else:
-            if not c_qte:
-                alertes = alertes.drop(columns=["Qté livrée"])
-            st.dataframe(colorie(alertes), use_container_width=True, hide_index=True)
+            al1, al2, al3 = st.columns(3)
+            al1.metric("🔴 À 100 % ou plus", n_rouge)
+            al2.metric("🟡 Au seuil d'alerte", n_jaune)
+            al3.metric("Dépassement total (Dh)",
+                       fmt(sit.loc[sit["Statut"] != STATUT_CLOS, "Dépassement"].sum()))
+            alertes = (sit[sit["Statut"].isin([STATUT_DEPASSE, STATUT_PROCHE])]
+                       .sort_values("% consommé", ascending=False))
+            if alertes.empty:
+                st.success(f"✅ Aucun bon de commande n'a atteint {seuil_alerte} %.")
+            else:
+                if not c_qte:
+                    alertes = alertes.drop(columns=["Qté livrée"])
+                st.dataframe(colorie(alertes), use_container_width=True, hide_index=True)
+    else:
+        st.caption(f"🟡 **Jaune** : plafond consommé à {seuil_alerte} % ou plus · 🔴 **Rouge** : "
+                   f"plafond atteint ou dépassé. Les plafonds se définissent dans l'onglet "
+                   f"« Plafond par client ».")
+        if sp.empty:
+            st.info("Aucun plafond client défini.")
+        else:
+            al1, al2, al3 = st.columns(3)
+            al1.metric("🔴 Plafond atteint ou dépassé", n_rouge_pl)
+            al2.metric("🟡 Au seuil d'alerte", n_jaune_pl)
+            al3.metric("Dépassement total (Dh)", fmt(sp["Dépassement"].sum()))
+            alertes_pl = (sp[sp["Statut"].isin([STATUT_DEPASSE, STATUT_PROCHE])]
+                          .sort_values("% consommé", ascending=False))
+            if alertes_pl.empty:
+                st.success(f"✅ Aucun client n'a atteint {seuil_alerte} % de son plafond.")
+            else:
+                st.dataframe(colorie(alertes_pl), use_container_width=True, hide_index=True)
 
 with onglets["📅 Par mois"]:
     afficher("Mois")
@@ -1290,7 +1342,8 @@ with onglets["📑 Bons de commande"]:
 
 with onglets["💰 Plafond par client"]:
     st.caption("Fixez un montant plafond (HT) par client : il est comparé au Montant HT Net livré "
-               "au client, selon les filtres sélectionnés. Le seuil d'alerte est celui de "
+               "au client, selon les filtres sélectionnés, sur toute la période ou sur une période "
+               "limitée (du … au …). Le seuil d'alerte est celui de "
                "l'onglet « Bons de commande ».")
     if sp.empty:
         st.info("Aucun plafond défini." + (" Ajoutez-en un ci-dessous." if est_admin else ""))
@@ -1318,6 +1371,17 @@ with onglets["💰 Plafond par client"]:
             actuel_pl = pl.get(client_pl, {})
             st.number_input("Montant plafond HT (Dh)", min_value=0.0, step=1000.0, format="%.2f",
                             value=float(actuel_pl.get("montant", 0.0)), key=f"pl_montant_{client_pl}")
+            st.checkbox("Limiter à une période (optionnel)",
+                        value=bool(actuel_pl.get("date_debut") or actuel_pl.get("date_fin")),
+                        key=f"pl_periode_{client_pl}")
+            if st.session_state.get(f"pl_periode_{client_pl}"):
+                p1, p2 = st.columns(2)
+                p1.date_input("Du", key=f"pl_d1_{client_pl}",
+                              value=(datetime.fromisoformat(actuel_pl["date_debut"]).date()
+                                     if actuel_pl.get("date_debut") else datetime.now().date()))
+                p2.date_input("Au", key=f"pl_d2_{client_pl}",
+                              value=(datetime.fromisoformat(actuel_pl["date_fin"]).date()
+                                     if actuel_pl.get("date_fin") else datetime.now().date()))
             st.text_input("Note (optionnel)", value=actuel_pl.get("note", ""),
                           key=f"pl_note_{client_pl}")
             st.button("Enregistrer le plafond", type="primary", on_click=cb_pl_enregistre)
@@ -1374,6 +1438,9 @@ with pd.ExcelWriter(buf, engine="openpyxl") as w:
 
     if not sp.empty:
         sp.to_excel(w, sheet_name="Plafond par client", index=False)
+        alertes_pl_exp = sp[sp["Statut"].isin([STATUT_DEPASSE, STATUT_PROCHE])]
+        if not alertes_pl_exp.empty:
+            alertes_pl_exp.to_excel(w, sheet_name="Alertes plafond", index=False)
 
     # 4. Application de la mise en page (A4, Paysage, Ajusté à la largeur) sur chaque feuille
     for ws in w.sheets.values():
