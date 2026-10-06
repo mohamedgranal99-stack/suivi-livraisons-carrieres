@@ -576,6 +576,7 @@ def sauvegarde_zip():
 
 # ---------- Bons de commande clients ----------
 TOUS = "(tous les chantiers)"
+TOUS_PRODUITS = "(tous les produits)"
 STATUT_OK, STATUT_PROCHE = "🟢 OK", "🟡 Alerte (seuil atteint)"
 STATUT_DEPASSE, STATUT_CLOS = "🔴 100 % atteint ou dépassé", "⚪ Clôturé"
 COULEURS_STATUT = {STATUT_DEPASSE: "background-color: #f8d7da; color: #842029",
@@ -601,7 +602,7 @@ def _bc_valide(ref, client, montant, periode, d1, d2, autres, ignorer_id=None):
     if not client:
         return "Choisissez le client."
     if montant <= 0:
-        return "Le montant NET HT doit être supérieur à 0."
+        return "Le montant HT doit être supérieur à 0."
     if any(b["ref"].lower() == ref.lower() and b["id"] != ignorer_id for b in autres):
         return f"La référence « {ref} » existe déjà."
     if periode and d1 and d2 and d1 > d2:
@@ -615,6 +616,7 @@ def cb_bc_ajoute():
     ref = (ss.get("bc_ref") or "").strip()
     client = ss.get("bc_client")
     chantier = ss.get(f"bc_chantier_{client}")
+    produit = ss.get(f"bc_produit_{client}")
     montant = float(ss.get("bc_montant") or 0)
     periode = bool(ss.get("bc_periode"))
     d1, d2 = (ss.get("bc_d1"), ss.get("bc_d2")) if periode else (None, None)
@@ -624,6 +626,7 @@ def cb_bc_ajoute():
         return
     bcs.append({"id": pysecrets.token_hex(4), "ref": ref, "client": client,
                 "chantier": "" if chantier in (None, TOUS) else chantier,
+                "produit": "" if produit in (None, TOUS_PRODUITS) else produit,
                 "montant": montant, "date_debut": date_iso(d1), "date_fin": date_iso(d2),
                 "clos": False, "note": (ss.get("bc_note") or "").strip(),
                 "cree_par": moi() or "", "cree_le": datetime.now().isoformat(timespec="seconds")})
@@ -647,6 +650,12 @@ def cb_bc_modifie(bid):
     if erreur:
         msg("error", erreur)
         return
+    if f"bce_chantier_{bid}" in ss:
+        ch = ss[f"bce_chantier_{bid}"]
+        bc["chantier"] = "" if ch in (None, TOUS) else ch
+    if f"bce_produit_{bid}" in ss:
+        pr = ss[f"bce_produit_{bid}"]
+        bc["produit"] = "" if pr in (None, TOUS_PRODUITS) else pr
     bc.update({"ref": ref, "montant": montant, "date_debut": date_iso(d1), "date_fin": date_iso(d2),
                "clos": bool(ss.get(f"bce_clos_{bid}")), "note": (ss.get(f"bce_note_{bid}") or "").strip()})
     sauve_bc(bcs)
@@ -662,8 +671,9 @@ def cb_bc_supprime(bid):
 
 def colorie(d):
     d = d.drop(columns=["id"], errors="ignore")
-    formats = {"Montant BC (HT net)": "{:,.2f}", "Livré (HT net)": "{:,.2f}", "Reste": "{:,.2f}",
-               "Dépassement": "{:,.2f}", "% consommé": "{:.0f} %", "Qté livrée": "{:,.2f}"}
+    formats = {"Montant BC (HT)": "{:,.2f}", "Livré (HT)": "{:,.2f}", "Reste": "{:,.2f}",
+               "Dépassement": "{:,.2f}", "% consommé": "{:.0f} %", "Qté livrée": "{:,.2f}",
+               "Plafond (HT)": "{:,.2f}"}
     try:
         return (d.style.apply(lambda r: [COULEURS_STATUT.get(r["Statut"], "")] * len(r), axis=1)
                 .format({k: v for k, v in formats.items() if k in d.columns}, na_rep=""))
@@ -676,14 +686,16 @@ def _fr(iso):
 
 
 def calcule_situation(base, bcs, seuil):
-    colonnes = ["id", "Référence BC", "Client", "Chantier", "Période", "Montant BC (HT net)",
-                "Livré (HT net)", "Reste", "Dépassement", "% consommé", "Statut", "Qté livrée"]
+    colonnes = ["id", "Référence BC", "Client", "Chantier", "Produit", "Période", "Montant BC (HT)",
+                "Livré (HT)", "Reste", "Dépassement", "% consommé", "Statut", "Qté livrée"]
     qcol = next(iter(QTES), None)
     lignes = []
     for bc in bcs:
         sub = base[base["Client"] == bc["client"]]
         if bc.get("chantier") and "Chantier" in sub.columns:
             sub = sub[sub["Chantier"] == bc["chantier"]]
+        if bc.get("produit"):
+            sub = sub[sub["Produit"] == bc["produit"]]
         if bc.get("date_debut"):
             sub = sub[sub["Jour"] >= bc["date_debut"]]
         if bc.get("date_fin"):
@@ -703,11 +715,63 @@ def calcule_situation(base, bcs, seuil):
         periode = ("toute la période" if not (d1 or d2) else
                    f"{_fr(d1) if d1 else '…'} → {_fr(d2) if d2 else '…'}")
         lignes.append({"id": bc["id"], "Référence BC": bc["ref"], "Client": bc["client"],
-                       "Chantier": bc.get("chantier") or "(tous)", "Période": periode,
-                       "Montant BC (HT net)": montant, "Livré (HT net)": livre,
+                       "Chantier": bc.get("chantier") or "(tous)",
+                       "Produit": bc.get("produit") or "(tous)", "Période": periode,
+                       "Montant BC (HT)": montant, "Livré (HT)": livre,
                        "Reste": max(montant - livre, 0.0), "Dépassement": max(livre - montant, 0.0),
                        "% consommé": round(pct, 1), "Statut": statut,
                        "Qté livrée": float(sub[qcol].sum()) if qcol else None})
+    return pd.DataFrame(lignes, columns=colonnes)
+
+
+
+# ---------- Plafond (montant maximum) par client ----------
+def charge_plafonds():
+    d = kv_get("plafonds", {})
+    return d if isinstance(d, dict) else {}
+
+
+def cb_pl_enregistre():
+    ss = st.session_state
+    client = ss.get("pl_client")
+    montant = float(ss.get(f"pl_montant_{client}") or 0)
+    if not client:
+        msg("error", "Choisissez le client.")
+    elif montant <= 0:
+        msg("error", "Le montant plafond doit être supérieur à 0.")
+    else:
+        d = charge_plafonds()
+        d[client] = {"montant": montant, "note": (ss.get(f"pl_note_{client}") or "").strip(),
+                     "maj_par": moi() or "", "maj_le": datetime.now().isoformat(timespec="seconds")}
+        kv_set("plafonds", d)
+        msg("success", f"Plafond de « {client} » enregistré.")
+
+
+def cb_pl_supprime(client):
+    d = charge_plafonds()
+    if client in d:
+        del d[client]
+        kv_set("plafonds", d)
+        msg("success", f"Plafond de « {client} » supprimé.")
+
+
+def situation_plafonds(base, plafonds, seuil):
+    colonnes = ["Client", "Plafond (HT)", "Livré (HT)", "Reste", "Dépassement", "% consommé",
+                "Statut", "Note"]
+    lignes = []
+    for client, p in plafonds.items():
+        plafond = float(p.get("montant", 0))
+        livre = float(base.loc[base["Client"] == client, "Montant HT Net"].sum())
+        pct = livre / plafond * 100 if plafond > 0 else 0.0
+        if round(livre, 2) >= round(plafond, 2):
+            statut = STATUT_DEPASSE
+        elif pct >= seuil:
+            statut = STATUT_PROCHE
+        else:
+            statut = STATUT_OK
+        lignes.append({"Client": client, "Plafond (HT)": plafond, "Livré (HT)": livre,
+                       "Reste": max(plafond - livre, 0.0), "Dépassement": max(livre - plafond, 0.0),
+                       "% consommé": round(pct, 1), "Statut": statut, "Note": p.get("note", "")})
     return pd.DataFrame(lignes, columns=colonnes)
 
 
@@ -1021,6 +1085,8 @@ seuil_alerte = int(st.session_state.get("bc_seuil", 80))
 
 # Calcul sur les données filtrées f
 sit = calcule_situation(f, bcs, seuil_alerte)
+pl = charge_plafonds()
+sp = situation_plafonds(f, pl, seuil_alerte)
 n_rouge = n_jaune = 0
 if not sit.empty:
     depasses = sit[sit["Statut"] == STATUT_DEPASSE]
@@ -1087,6 +1153,7 @@ noms_onglets = [TAB_ALERTES, "📅 Par mois", "📆 Par jour", "🏭 Par carriè
 if c_chantier:
     noms_onglets.append("🏗️ Par chantier")
 noms_onglets.append("📑 Bons de commande")
+noms_onglets.append("💰 Plafond par client")
 noms_onglets.append("📋 Détail")
 onglets = dict(zip(noms_onglets, st.tabs(noms_onglets)))
 
@@ -1127,8 +1194,9 @@ if c_chantier:
     with onglets["🏗️ Par chantier"]:
         afficher("Chantier", "Mois")
 with onglets["📑 Bons de commande"]:
-    st.caption("Pour chaque bon de commande, le montant livré (Montant HT Net des livraisons du "
-               "client) est comparé au montant NET HT du bon selon les filtres sélectionnés.")
+    st.caption("Pour chaque bon de commande, le montant livré (Montant HT des livraisons du "
+               "client) est comparé au montant HT du bon selon les filtres sélectionnés. "
+               "Un bon peut être limité à un chantier et/ou à un produit.")
     st.number_input("Seuil d'alerte (% du bon déjà consommé)", min_value=10, max_value=100,
                     value=80, step=5, key="bc_seuil")
     if sit.empty:
@@ -1143,8 +1211,8 @@ with onglets["📑 Bons de commande"]:
         if not c_qte:
             aff = aff.drop(columns=["Qté livrée"])
         st.dataframe(aff, use_container_width=True, hide_index=True, column_config={
-            "Montant BC (HT net)": st.column_config.NumberColumn(format="%.2f"),
-            "Livré (HT net)": st.column_config.NumberColumn(format="%.2f"),
+            "Montant BC (HT)": st.column_config.NumberColumn(format="%.2f"),
+            "Livré (HT)": st.column_config.NumberColumn(format="%.2f"),
             "Reste": st.column_config.NumberColumn(format="%.2f"),
             "Dépassement": st.column_config.NumberColumn(format="%.2f"),
             "% consommé": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f%%"),
@@ -1158,11 +1226,15 @@ with onglets["📑 Bons de commande"]:
                           placeholder="ex. BC-2026-0145")
             client_bc = a2.selectbox("Client", clients_liste, key="bc_client")
             a3, a4 = st.columns(2)
-            a3.number_input("Montant NET HT du bon de commande (Dh)", min_value=0.0, step=1000.0,
+            a3.number_input("Montant HT du bon de commande (Dh)", min_value=0.0, step=1000.0,
                             format="%.2f", key="bc_montant")
             if c_chantier:
                 chs = sorted(df.loc[df["Client"] == client_bc, "Chantier"].unique(), key=str)
                 a4.selectbox("Chantier (optionnel)", [TOUS] + chs, key=f"bc_chantier_{client_bc}")
+            prods = sorted(df.loc[df["Client"] == client_bc, "Produit"].unique(), key=str)
+            b1, _b2 = st.columns(2)
+            b1.selectbox("Produit (optionnel)", [TOUS_PRODUITS] + prods,
+                         key=f"bc_produit_{client_bc}")
             st.checkbox("Limiter à une période (optionnel)", key="bc_periode")
             if st.session_state.get("bc_periode"):
                 p1, p2 = st.columns(2)
@@ -1178,10 +1250,23 @@ with onglets["📑 Bons de commande"]:
                                    key="bc_sel")
                 bc = next(b for b in bcs if b["id"] == bid)
                 st.text_input("Référence", value=bc["ref"], key=f"bce_ref_{bid}")
-                st.number_input("Montant NET HT (Dh)", min_value=0.0, step=1000.0, format="%.2f",
+                st.number_input("Montant HT (Dh)", min_value=0.0, step=1000.0, format="%.2f",
                                 value=float(bc["montant"]), key=f"bce_montant_{bid}")
                 st.checkbox("Clôturé (plus d'alerte pour ce bon)", value=bool(bc.get("clos")),
                             key=f"bce_clos_{bid}")
+                cl_bc = bc["client"]
+                e1, e2 = st.columns(2)
+                if c_chantier:
+                    chs = sorted(set(df.loc[df["Client"] == cl_bc, "Chantier"].unique())
+                                 | ({bc["chantier"]} if bc.get("chantier") else set()), key=str)
+                    opts_c = [TOUS] + chs
+                    e1.selectbox("Chantier", opts_c, key=f"bce_chantier_{bid}",
+                                 index=opts_c.index(bc["chantier"]) if bc.get("chantier") in opts_c else 0)
+                prods = sorted(set(df.loc[df["Client"] == cl_bc, "Produit"].unique())
+                               | ({bc["produit"]} if bc.get("produit") else set()), key=str)
+                opts_p = [TOUS_PRODUITS] + prods
+                e2.selectbox("Produit", opts_p, key=f"bce_produit_{bid}",
+                             index=opts_p.index(bc["produit"]) if bc.get("produit") in opts_p else 0)
                 a_periode = st.checkbox("Limiter à une période",
                                         value=bool(bc.get("date_debut") or bc.get("date_fin")),
                                         key=f"bce_periode_{bid}")
@@ -1202,6 +1287,44 @@ with onglets["📑 Bons de commande"]:
                     st.write(f"Supprimer **{bc['ref']}** ?")
                     st.button("Oui, supprimer", key=f"bc_del_{bid}", on_click=cb_bc_supprime,
                               args=(bid,))
+
+with onglets["💰 Plafond par client"]:
+    st.caption("Fixez un montant plafond (HT) par client : il est comparé au Montant HT Net livré "
+               "au client, selon les filtres sélectionnés. Le seuil d'alerte est celui de "
+               "l'onglet « Bons de commande ».")
+    if sp.empty:
+        st.info("Aucun plafond défini." + (" Ajoutez-en un ci-dessous." if est_admin else ""))
+    else:
+        r_pl = int((sp["Statut"] == STATUT_DEPASSE).sum())
+        j_pl = int((sp["Statut"] == STATUT_PROCHE).sum())
+        q1, q2, q3, q4 = st.columns(4)
+        q1.metric("Clients avec plafond", len(sp))
+        q2.metric("🔴 Plafond atteint ou dépassé", r_pl)
+        q3.metric("🟡 Au seuil d'alerte", j_pl)
+        q4.metric("Dépassement total (Dh)", fmt(sp["Dépassement"].sum()))
+        st.dataframe(colorie(sp.sort_values("% consommé", ascending=False)),
+                     use_container_width=True, hide_index=True)
+    livre_clients = f.groupby("Client")["Montant HT Net"].sum()
+    sans_plafond = livre_clients[~livre_clients.index.isin(list(pl))].sort_values(ascending=False)
+    if not sans_plafond.empty:
+        with st.expander(f"Clients sans plafond défini ({len(sans_plafond)})"):
+            st.dataframe(sans_plafond.rename("Livré (HT)").reset_index(),
+                         use_container_width=True, hide_index=True)
+
+    if est_admin:
+        with st.expander("➕ Définir ou modifier un plafond", expanded=sp.empty):
+            clients_pl = sorted(df["Client"].unique(), key=str)
+            client_pl = st.selectbox("Client", clients_pl, key="pl_client")
+            actuel_pl = pl.get(client_pl, {})
+            st.number_input("Montant plafond HT (Dh)", min_value=0.0, step=1000.0, format="%.2f",
+                            value=float(actuel_pl.get("montant", 0.0)), key=f"pl_montant_{client_pl}")
+            st.text_input("Note (optionnel)", value=actuel_pl.get("note", ""),
+                          key=f"pl_note_{client_pl}")
+            st.button("Enregistrer le plafond", type="primary", on_click=cb_pl_enregistre)
+        if pl:
+            with st.expander("🗑️ Supprimer un plafond"):
+                cible = st.selectbox("Client", sorted(pl), key="pl_del")
+                st.button("Supprimer ce plafond", on_click=cb_pl_supprime, args=(cible,))
 
 with onglets["📋 Détail"]:
     st.dataframe(f, use_container_width=True)
@@ -1248,6 +1371,9 @@ with pd.ExcelWriter(buf, engine="openpyxl") as w:
         alertes_exp = sit[sit["Statut"].isin([STATUT_DEPASSE, STATUT_PROCHE])].drop(columns=["id"], errors="ignore")
         if not alertes_exp.empty:
             alertes_exp.to_excel(w, sheet_name="Alertes", index=False)
+
+    if not sp.empty:
+        sp.to_excel(w, sheet_name="Plafond par client", index=False)
 
     # 4. Application de la mise en page (A4, Paysage, Ajusté à la largeur) sur chaque feuille
     for ws in w.sheets.values():
