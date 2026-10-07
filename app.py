@@ -1659,7 +1659,7 @@ with onglets["🧾 Règlement client"]:
                 h5.text_input("Référence", value=cur["Référence"], key=f"rgm_ref_{rid_m}")
                 h6.text_input("Note", value=cur["Note"], key=f"rgm_note_{rid_m}")
                 st.button("Enregistrer les modifications", type="primary", on_click=cb_rg_modifie,
-                          args=(rid_m, cur["Client"]))
+                          args=(rid_m, cur["Client"]), key="rg_btn_modifie")
             with st.expander("🗑️ Supprimer un règlement"):
                 libelles = {r["id"]: (f"{_fr(r['Date']) if r['Date'] else '—'} · {r['Client']} · "
                                       f"{r['Montant TTC']:,.2f} Dh · {r['Mode']} {r['Référence']}")
