@@ -1166,6 +1166,12 @@ HT_DISPO = bool(df["Montant HT"].ne(0).any())
 sans_date = df[df["Jour"].isna()].copy()
 df = df[df["Jour"].notna()].copy()
 
+# Seules l'année en cours et l'année précédente sont affichées (ex. en 2026 : 2025 et 2026)
+ANNEE_COURANTE = datetime.now().year
+ANNEES_AFFICHEES = [str(ANNEE_COURANTE - 1), str(ANNEE_COURANTE)]
+df = df[df["Année"].isin(ANNEES_AFFICHEES)].copy()
+HT_DISPO = bool(df["Montant HT"].ne(0).any())
+
 c_client, c_produit = "Client", "Produit"
 df = df[~df[c_client].str.lower().isin(["", "nan", "none"])]
 masque_total = (df[c_client].str.lower().str.contains("total")
@@ -1180,7 +1186,8 @@ c_qte = bool(QTES)
 n_remplacees = 0
 
 if df.empty:
-    st.warning("Aucune ligne exploitable. Vérifiez les fichiers importés.")
+    st.warning(f"Aucune ligne exploitable pour {ANNEES_AFFICHEES[0]} et {ANNEES_AFFICHEES[1]}. "
+               f"Vérifiez les fichiers importés.")
     st.stop()
 
 # ---------- Lignes en double ----------
@@ -1241,6 +1248,7 @@ st.sidebar.subheader("Filtres")
 st.sidebar.button("↺ Réinitialiser les filtres", on_click=cb_reset_filtres)
 carrieres = st.sidebar.multiselect("Carrière", options_possibles("f_carriere"), key="f_carriere")
 annees = st.sidebar.multiselect("Année", options_possibles("f_annee"), key="f_annee")
+st.sidebar.caption(f"📅 Données affichées : {ANNEES_AFFICHEES[0]} et {ANNEES_AFFICHEES[1]} uniquement")
 mois = st.sidebar.multiselect("Mois", options_possibles("f_mois"), key="f_mois")
 clients = st.sidebar.multiselect("Client", options_possibles("f_client"), key="f_client")
 produits = st.sidebar.multiselect("Produit", options_possibles("f_produit"), key="f_produit")
