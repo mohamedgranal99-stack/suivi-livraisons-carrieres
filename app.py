@@ -877,6 +877,30 @@ def cb_rg_ajoute():
         msg("success", f"Règlement de {montant:,.2f} Dh TTC enregistré pour « {client} ».")
 
 
+def cb_rg_modifie(rid, ancien_client):
+    ss = st.session_state
+    nouveau = ss.get(f"rgm_client_{rid}") or ancien_client
+    montant = float(ss.get(f"rgm_montant_{rid}") or 0)
+    if montant <= 0:
+        msg("error", "Le montant du règlement (TTC) doit être supérieur à 0.")
+        return
+    d = charge_reglements()
+    ancien = next((r for r in d.get(ancien_client, []) if r.get("id") == rid), None)
+    if ancien is None:
+        msg("error", "Règlement introuvable (déjà supprimé ?).")
+        return
+    d[ancien_client] = [r for r in d[ancien_client] if r.get("id") != rid]
+    if not d[ancien_client]:
+        del d[ancien_client]
+    ancien.update({"date": date_iso(ss.get(f"rgm_date_{rid}")), "montant_ttc": montant,
+                   "mode": ss.get(f"rgm_mode_{rid}") or "", "ref": (ss.get(f"rgm_ref_{rid}") or "").strip(),
+                   "note": (ss.get(f"rgm_note_{rid}") or "").strip(),
+                   "modifie_par": moi() or "", "modifie_le": datetime.now().isoformat(timespec="seconds")})
+    d.setdefault(nouveau, []).append(ancien)
+    kv_set("reglements", d)
+    msg("success", f"Règlement modifié : {montant:,.2f} Dh TTC pour « {nouveau} ».")
+
+
 def cb_rg_supprime(client, rid):
     d = charge_reglements()
     avant = len(d.get(client, []))
@@ -1608,6 +1632,34 @@ with onglets["🧾 Règlement client"]:
             st.caption(f"Reste du plafond après ce règlement : **{fmt(max(apres, 0))} Dh TTC**")
             st.button("Enregistrer le règlement", type="primary", on_click=cb_rg_ajoute)
         if not det.empty:
+            libelles_m = {r["id"]: (f"{_fr(r['Date']) if r['Date'] else '—'} · {r['Client']} · "
+                                    f"{r['Montant TTC']:,.2f} Dh · {r['Mode']} {r['Référence']}")
+                          for _, r in det.iterrows()}
+            with st.expander("✏️ Modifier un règlement"):
+                rid_m = st.selectbox("Règlement à modifier", list(libelles_m),
+                                     format_func=libelles_m.get, key="rg_mod_sel")
+                cur = det[det["id"] == rid_m].iloc[0]
+                clients_m = sorted(pl, key=str)
+                if cur["Client"] not in clients_m:
+                    clients_m.append(cur["Client"])
+                modes_m = MODES_REGLEMENT + ([cur["Mode"]] if cur["Mode"] and cur["Mode"] not in MODES_REGLEMENT else [])
+                h1, h2 = st.columns(2)
+                h1.selectbox("Client", clients_m, index=clients_m.index(cur["Client"]),
+                             key=f"rgm_client_{rid_m}")
+                h2.date_input("Date du règlement",
+                              value=(datetime.fromisoformat(cur["Date"]).date() if cur["Date"]
+                                     else datetime.now().date()), key=f"rgm_date_{rid_m}")
+                h3, h4 = st.columns(2)
+                h3.number_input("Montant du règlement TTC (Dh)", min_value=0.0, step=1000.0,
+                                format="%.2f", value=float(cur["Montant TTC"]), key=f"rgm_montant_{rid_m}")
+                h4.selectbox("Mode de règlement", modes_m,
+                             index=modes_m.index(cur["Mode"]) if cur["Mode"] in modes_m else 0,
+                             key=f"rgm_mode_{rid_m}")
+                h5, h6 = st.columns(2)
+                h5.text_input("Référence", value=cur["Référence"], key=f"rgm_ref_{rid_m}")
+                h6.text_input("Note", value=cur["Note"], key=f"rgm_note_{rid_m}")
+                st.button("Enregistrer les modifications", type="primary", on_click=cb_rg_modifie,
+                          args=(rid_m, cur["Client"]))
             with st.expander("🗑️ Supprimer un règlement"):
                 libelles = {r["id"]: (f"{_fr(r['Date']) if r['Date'] else '—'} · {r['Client']} · "
                                       f"{r['Montant TTC']:,.2f} Dh · {r['Mode']} {r['Référence']}")
