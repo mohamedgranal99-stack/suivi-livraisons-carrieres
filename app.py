@@ -730,7 +730,7 @@ def colorie(d):
     formats = {"Montant BC (HT)": "{:,.2f}", "Livré (HT)": "{:,.2f}", "Reste": "{:,.2f}",
                "Dépassement": "{:,.2f}", "% consommé": "{:.0f} %", "Qté livrée": "{:,.2f}",
                "Plafond (HT)": "{:,.2f}", "Plafond TTC": "{:,.2f}",
-               "Total réglé (TTC)": "{:,.2f}", "Reste plafond (TTC)": "{:,.2f}",
+               "Total réglé (TTC)": "{:,.2f}", "Reste plafond (TTC)": "{:,.2f}", "Livré TTC": "{:,.2f}",
                "Montant TTC": "{:,.2f}"}
     try:
         return (d.style.apply(lambda r: [COULEURS_STATUT.get(r["Statut"], "")] * len(r), axis=1)
@@ -888,36 +888,39 @@ def cb_rg_supprime(client, rid):
         msg("success", "Règlement supprimé.")
 
 
-def _reglements_periode(liste, p):
-    d1, d2 = p.get("date_debut"), p.get("date_fin")
-    return [r for r in liste
-            if (not d1 or (r.get("date") or "") >= d1) and (not d2 or (r.get("date") or "") <= d2)]
-
-
-def situation_reglements(plafonds, reglements, seuil):
-    """Compare le total des règlements (TTC) au plafond client converti en TTC (HT × 1,20)."""
-    colonnes = ["Client", "Période", "Plafond (HT)", "Plafond TTC", "Total réglé (TTC)",
+def situation_reglements(base, plafonds, reglements, seuil):
+    """Reste plafond (TTC) = Plafond TTC − Livré TTC + Règlements TTC
+    avec Plafond TTC = Plafond HT × 1,20 et Livré TTC = Livré HT Net × 1,20."""
+    colonnes = ["Client", "Période", "Plafond (HT)", "Plafond TTC", "Livré TTC", "Total réglé (TTC)",
                 "Reste plafond (TTC)", "Dépassement", "% consommé", "Statut", "Nb règlements"]
     lignes = []
     for client, p in plafonds.items():
         plafond_ht = float(p.get("montant", 0))
         plafond_ttc = round(plafond_ht * TVA, 2)
-        regs = _reglements_periode(reglements.get(client, []), p)
-        regle = round(sum(float(r.get("montant_ttc", 0)) for r in regs), 2)
+        sub = base[base["Client"] == client]
         d1, d2 = p.get("date_debut"), p.get("date_fin")
+        if d1:
+            sub = sub[sub["Jour"] >= d1]
+        if d2:
+            sub = sub[sub["Jour"] <= d2]
+        livre_ttc = round(float(sub["Montant HT Net"].sum()) * TVA, 2)
+        regs = reglements.get(client, [])
+        regle = round(sum(float(r.get("montant_ttc", 0)) for r in regs), 2)
+        reste = round(plafond_ttc - livre_ttc + regle, 2)
+        encours = livre_ttc - regle  # part du plafond TTC encore consommée (livré non réglé)
         periode = ("toute la période" if not (d1 or d2) else
                    f"{_fr(d1) if d1 else '…'} → {_fr(d2) if d2 else '…'}")
-        pct = regle / plafond_ttc * 100 if plafond_ttc > 0 else 0.0
-        if round(regle, 2) >= round(plafond_ttc, 2):
+        pct = max(encours, 0.0) / plafond_ttc * 100 if plafond_ttc > 0 else 0.0
+        if round(encours, 2) >= round(plafond_ttc, 2):
             statut = STATUT_DEPASSE
         elif pct >= seuil:
             statut = STATUT_PROCHE
         else:
             statut = STATUT_OK
         lignes.append({"Client": client, "Période": periode, "Plafond (HT)": plafond_ht,
-                       "Plafond TTC": plafond_ttc, "Total réglé (TTC)": regle,
-                       "Reste plafond (TTC)": max(plafond_ttc - regle, 0.0),
-                       "Dépassement": max(regle - plafond_ttc, 0.0), "% consommé": round(pct, 1),
+                       "Plafond TTC": plafond_ttc, "Livré TTC": livre_ttc,
+                       "Total réglé (TTC)": regle, "Reste plafond (TTC)": max(reste, 0.0),
+                       "Dépassement": max(-reste, 0.0), "% consommé": round(pct, 1),
                        "Statut": statut, "Nb règlements": len(regs)})
     return pd.DataFrame(lignes, columns=colonnes)
 
@@ -1252,7 +1255,7 @@ sit = calcule_situation(f, bcs, seuil_alerte)
 pl = charge_plafonds()
 sp = situation_plafonds(f, pl, seuil_alerte)
 rg = charge_reglements()
-sr = situation_reglements(pl, rg, seuil_alerte)
+sr = situation_reglements(f, pl, rg, seuil_alerte)
 n_rouge = n_jaune = 0
 n_rouge_pl = n_jaune_pl = 0
 if not sit.empty:
@@ -1551,21 +1554,22 @@ with onglets["💰 Plafond par client"]:
                 st.button("Supprimer ce plafond", on_click=cb_pl_supprime, args=(cible,))
 
 with onglets["🧾 Règlement client"]:
-    st.caption(f"Chaque règlement (montant **TTC**) est déduit du plafond du client converti en TTC : "
-               f"**Plafond TTC = Plafond HT × {TVA:.2f}**. Si le plafond a une période, seuls les "
-               f"règlements datés dans cette période sont déduits. Le seuil d'alerte est celui de "
-               f"l'onglet « Bons de commande ».")
+    st.caption(f"**Plafond TTC = Plafond HT × {TVA:.2f}** · **Livré TTC = Livré HT Net × {TVA:.2f}** "
+               f"(sur la période du plafond, selon les filtres). **Reste plafond (TTC) = Plafond TTC "
+               f"− Livré TTC + Règlements TTC** : chaque règlement reconstitue le plafond du client. "
+               f"Le seuil d'alerte est celui de l'onglet « Bons de commande ».")
     if not pl:
         st.info("Aucun plafond client défini : définissez d'abord un plafond dans l'onglet "
                 "« Plafond par client ».")
     else:
         r_rg = int((sr["Statut"] == STATUT_DEPASSE).sum())
         j_rg = int((sr["Statut"] == STATUT_PROCHE).sum())
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Plafond total TTC (Dh)", fmt(sr["Plafond TTC"].sum()))
-        m2.metric("Total réglé TTC (Dh)", fmt(sr["Total réglé (TTC)"].sum()))
-        m3.metric("Reste du plafond TTC (Dh)", fmt(sr["Reste plafond (TTC)"].sum()))
-        m4.metric("🔴 Atteint / 🟡 au seuil", f"{r_rg} / {j_rg}")
+        m2.metric("Livré TTC (Dh)", fmt(sr["Livré TTC"].sum()))
+        m3.metric("Total réglé TTC (Dh)", fmt(sr["Total réglé (TTC)"].sum()))
+        m4.metric("Reste du plafond TTC (Dh)", fmt(sr["Reste plafond (TTC)"].sum()))
+        m5.metric("🔴 Atteint / 🟡 au seuil", f"{r_rg} / {j_rg}")
         st.dataframe(colorie(sr.sort_values("% consommé", ascending=False)),
                      use_container_width=True, hide_index=True)
 
@@ -1587,9 +1591,10 @@ with onglets["🧾 Règlement client"]:
         with st.expander("➕ Ajouter un règlement", expanded=det.empty):
             client_rg = st.selectbox("Client (avec plafond)", sorted(pl, key=str), key="rg_client")
             ligne_c = sr[sr["Client"] == client_rg].iloc[0]
-            st.info(f"Plafond TTC : **{fmt(ligne_c['Plafond TTC'])} Dh** (HT {fmt(ligne_c['Plafond (HT)'])} "
-                    f"× {TVA:.2f}) · déjà réglé : **{fmt(ligne_c['Total réglé (TTC)'])} Dh** · "
-                    f"reste : **{fmt(ligne_c['Reste plafond (TTC)'])} Dh**")
+            st.info(f"Plafond TTC : **{fmt(ligne_c['Plafond TTC'])} Dh** · livré TTC : "
+                    f"**{fmt(ligne_c['Livré TTC'])} Dh** · déjà réglé : "
+                    f"**{fmt(ligne_c['Total réglé (TTC)'])} Dh** · reste plafond : "
+                    f"**{fmt(ligne_c['Reste plafond (TTC)'])} Dh**")
             g1, g2 = st.columns(2)
             g1.date_input("Date du règlement", value=datetime.now().date(), key="rg_date")
             g2.number_input("Montant du règlement TTC (Dh)", min_value=0.0, step=1000.0,
@@ -1598,9 +1603,9 @@ with onglets["🧾 Règlement client"]:
             g3.selectbox("Mode de règlement", MODES_REGLEMENT, key="rg_mode")
             g4.text_input("Référence (n° chèque, virement…)", key="rg_ref")
             st.text_input("Note (optionnel)", key="rg_note")
-            apres = float(ligne_c["Reste plafond (TTC)"]) - float(st.session_state.get("rg_montant") or 0)
-            if apres < 0:
-                st.warning(f"⚠️ Ce règlement dépasse le plafond TTC de {fmt(-apres)} Dh.")
+            apres = (float(ligne_c["Plafond TTC"]) - float(ligne_c["Livré TTC"])
+                     + float(ligne_c["Total réglé (TTC)"]) + float(st.session_state.get("rg_montant") or 0))
+            st.caption(f"Reste du plafond après ce règlement : **{fmt(max(apres, 0))} Dh TTC**")
             st.button("Enregistrer le règlement", type="primary", on_click=cb_rg_ajoute)
         if not det.empty:
             with st.expander("🗑️ Supprimer un règlement"):
