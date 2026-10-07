@@ -728,7 +728,7 @@ def cb_bc_supprime(bid):
 def colorie(d):
     d = d.drop(columns=["id"], errors="ignore")
     formats = {"Montant BC (HT)": "{:,.2f}", "Livré (HT)": "{:,.2f}", "Reste": "{:,.2f}",
-               "Réglé (TTC)": "{:,.2f}", "Réglé (HT)": "{:,.2f}",
+               "Réglé (TTC)": "{:,.2f}", "Réglé (HT)": "{:,.2f}", "Reste HT": "{:,.2f}",
                "Dépassement": "{:,.2f}", "% consommé": "{:.0f} %", "Qté livrée": "{:,.2f}",
                "Plafond (HT)": "{:,.2f}", "Plafond TTC": "{:,.2f}",
                "Total réglé (TTC)": "{:,.2f}", "Reste plafond (TTC)": "{:,.2f}", "Livré TTC": "{:,.2f}",
@@ -821,10 +821,10 @@ def cb_pl_supprime(client):
 
 def situation_plafonds(base, plafonds, seuil, reglements=None):
     """Plafond (HT) comparé au livré HT Net, diminué des règlements du client.
-    Réglé (HT) = Réglé (TTC) / 1,20 ; Reste = Plafond − Livré + Réglé (HT)."""
+    Réglé (HT) = Réglé (TTC) / 1,20 ; Reste HT = Plafond − Livré + Réglé (HT)."""
     reglements = reglements or {}
     colonnes = ["Client", "Période", "Plafond (HT)", "Livré (HT)", "Réglé (TTC)", "Réglé (HT)",
-                "Reste", "Dépassement", "% consommé", "Statut", "Note"]
+                "Reste HT", "Dépassement", "% consommé", "Statut", "Note"]
     lignes = []
     for client, p in plafonds.items():
         plafond = float(p.get("montant", 0))
@@ -849,7 +849,8 @@ def situation_plafonds(base, plafonds, seuil, reglements=None):
             statut = STATUT_OK
         lignes.append({"Client": client, "Période": periode, "Plafond (HT)": plafond,
                        "Livré (HT)": livre, "Réglé (TTC)": regle_ttc, "Réglé (HT)": regle_ht,
-                       "Reste": max(plafond - encours, 0.0), "Dépassement": max(encours - plafond, 0.0),
+                       "Reste HT": max(plafond - encours, 0.0),
+                       "Dépassement": max(encours - plafond, 0.0),
                        "% consommé": round(pct, 1), "Statut": statut, "Note": p.get("note", "")})
     return pd.DataFrame(lignes, columns=colonnes)
 
@@ -1546,7 +1547,7 @@ with onglets["💰 Plafond par client"]:
     st.caption("Fixez un montant plafond (HT) par client : il est comparé au Montant HT Net livré "
                "au client, selon les filtres sélectionnés, sur toute la période ou sur une période "
                "limitée (du … au …). Les règlements du client (saisis en TTC dans l'onglet « Règlement "
-               "client », convertis en HT ÷ 1,20) sont déduits : Reste = Plafond − Livré + Réglé (HT). "
+               "client », convertis en HT ÷ 1,20) sont déduits : Reste HT = Plafond − Livré + Réglé (HT). "
                "Le seuil d'alerte est celui de "
                "l'onglet « Bons de commande ».")
     if sp.empty:
