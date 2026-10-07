@@ -27,6 +27,17 @@ except Exception:
     _icone = "🚚"
 
 st.set_page_config(page_title="Suivi livraisons carrières", page_icon=_icone, layout="wide")
+# Chiffres des indicateurs : taille adaptée et jamais tronqués (pas de « … »)
+st.markdown("""
+<style>
+[data-testid="stMetricValue"] { font-size: clamp(1.15rem, 1.9vw, 1.9rem); line-height: 1.25; }
+[data-testid="stMetricValue"] > div {
+    overflow: visible !important; text-overflow: clip !important;
+    white-space: normal !important; word-break: break-word;
+}
+[data-testid="stMetricLabel"] p { white-space: normal !important; }
+</style>
+""", unsafe_allow_html=True)
 if LOGO:
     try:
         _c_logo, _c_titre = st.columns([1, 9], vertical_alignment="center")
