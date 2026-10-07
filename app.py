@@ -140,7 +140,7 @@ def sb_ecrire(methode, table, params=None, json_=None, extra=None):
         raise RuntimeError(f"Supabase {r.status_code} : {r.text[:300]}")
 
 
-@st.cache_data(ttl=30, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def _kv_lire(cle):
     rows = sb_lire("kv", {"select": "valeur", "cle": f"eq.{cle}"})
     return rows[0]["valeur"] if rows else None
@@ -1164,40 +1164,48 @@ if not sel_fichiers:
     st.warning("Sélectionnez au moins un fichier dans la barre latérale.")
     st.stop()
 
-brut = data[data["fichier"].isin(sel_fichiers)]
-dj = pd.to_datetime(brut["date_livraison"], errors="coerce")
-df = pd.DataFrame({
-    "Carrière": brut["carriere"],
-    "Fichier": brut["fichier"],
-    "Feuille": brut["feuille"].fillna(""),
-    "Jour": dj.dt.strftime("%Y-%m-%d"),
-    "Année": dj.dt.strftime("%Y"),
-    "Mois": dj.dt.strftime("%Y-%m"),
-    "Client": texte_propre(brut["client"]),
-    "Produit": texte_propre(brut["produit"]),
-    "Chantier": texte_propre(brut["chantier"]),
-    "Quantité (T)": brut["qte_tonnes"].fillna(0),
-    "Quantité (m³)": brut["qte_m3"].fillna(0),
-    "Montant HT": brut["montant_ht_brut"].fillna(0),
-    "Montant HT Net": brut["montant_ht"].fillna(0),
-})
-HT_DISPO = bool(df["Montant HT"].ne(0).any())
-sans_date = df[df["Jour"].isna()].copy()
-df = df[df["Jour"].notna()].copy()
+@st.cache_data(show_spinner="Préparation des données…")
+def prepare_df(_data, version, sel_fichiers, annee_courante):
+    """Nettoyage lourd des données : exécuté une seule fois tant que les données ne changent pas."""
+    brut = _data[_data["fichier"].isin(sel_fichiers)]
+    dj = pd.to_datetime(brut["date_livraison"], errors="coerce")
+    d = pd.DataFrame({
+        "Carrière": brut["carriere"],
+        "Fichier": brut["fichier"],
+        "Feuille": brut["feuille"].fillna(""),
+        "Jour": dj.dt.strftime("%Y-%m-%d"),
+        "Année": dj.dt.strftime("%Y"),
+        "Mois": dj.dt.strftime("%Y-%m"),
+        "Client": texte_propre(brut["client"]),
+        "Produit": texte_propre(brut["produit"]),
+        "Chantier": texte_propre(brut["chantier"]),
+        "Quantité (T)": brut["qte_tonnes"].fillna(0),
+        "Quantité (m³)": brut["qte_m3"].fillna(0),
+        "Montant HT": brut["montant_ht_brut"].fillna(0),
+        "Montant HT Net": brut["montant_ht"].fillna(0),
+    })
+    sans_date = d[d["Jour"].isna()].copy()
+    d = d[d["Jour"].notna()].copy()
+    # Seules l'année en cours et l'année précédente sont affichées
+    d = d[d["Année"].isin([str(annee_courante - 1), str(annee_courante)])].copy()
+    d = d[~d["Client"].str.lower().isin(["", "nan", "none"])]
+    masque_total = (d["Client"].str.lower().str.contains("total")
+                    | d["Produit"].str.lower().str.contains("total"))
+    d = d[~masque_total].copy()
+    d["Chantier"] = d["Chantier"].where(~d["Chantier"].str.lower().isin(["", "nan", "none", "nat"]),
+                                        "(non renseigné)")
+    cols_src = [c for c in d.columns if c not in ("Fichier", "Feuille")]
+    n_dup = int(d.duplicated(subset=cols_src).sum())
+    return d, sans_date, n_dup
 
-# Seules l'année en cours et l'année précédente sont affichées (ex. en 2026 : 2025 et 2026)
+
 ANNEE_COURANTE = datetime.now().year
 ANNEES_AFFICHEES = [str(ANNEE_COURANTE - 1), str(ANNEE_COURANTE)]
-df = df[df["Année"].isin(ANNEES_AFFICHEES)].copy()
+_version = (len(data), int(pd.to_numeric(data["id"], errors="coerce").sum()))
+df, sans_date, n_dup = prepare_df(data, _version, tuple(sel_fichiers), ANNEE_COURANTE)
 HT_DISPO = bool(df["Montant HT"].ne(0).any())
 
 c_client, c_produit = "Client", "Produit"
-df = df[~df[c_client].str.lower().isin(["", "nan", "none"])]
-masque_total = (df[c_client].str.lower().str.contains("total")
-                | df[c_produit].str.lower().str.contains("total"))
-df = df[~masque_total].copy()
-df["Chantier"] = df["Chantier"].where(~df["Chantier"].str.lower().isin(["", "nan", "none", "nat"]),
-                                      "(non renseigné)")
 c_chantier = "Chantier" if (df["Chantier"] != "(non renseigné)").any() else None
 QTES = [q for q in ("Quantité (T)", "Quantité (m³)") if df[q].ne(0).any()]
 UNITES = {"Quantité (T)": "T", "Quantité (m³)": "m³"}
@@ -1211,7 +1219,6 @@ if df.empty:
 
 # ---------- Lignes en double ----------
 colonnes_source = [c for c in df.columns if c not in ("Fichier", "Feuille")]
-n_dup = int(df.duplicated(subset=colonnes_source).sum())
 retirer = False
 if n_dup:
     st.sidebar.warning(f"{n_dup} ligne(s) strictement identique(s) détectée(s).")
@@ -1223,11 +1230,12 @@ if retirer:
 
 # ---------- Vérification des totaux ----------
 with st.expander("🔎 Vérification des totaux par carrière, fichier, feuille et mois"):
-    agg = {"Lignes": ("Montant HT Net", "size"), "Montant_HT_Net": ("Montant HT Net", "sum")}
-    for q in QTES:
-        agg[q] = (q, "sum")
-    verif = df.groupby(["Carrière", "Fichier", "Feuille", "Mois"]).agg(**agg).reset_index()
-    st.dataframe(verif, use_container_width=True)
+    if st.checkbox("Afficher le tableau de vérification", key="aff_verif"):
+        agg = {"Lignes": ("Montant HT Net", "size"), "Montant_HT_Net": ("Montant HT Net", "sum")}
+        for q in QTES:
+            agg[q] = (q, "sum")
+        verif = df.groupby(["Carrière", "Fichier", "Feuille", "Mois"]).agg(**agg).reset_index()
+        st.dataframe(verif, use_container_width=True)
     if n_remplacees:
         st.info(f"{n_remplacees} ligne(s) ignorée(s) car un fichier plus récent de la même "
                 f"carrière couvre les mêmes jours.")
@@ -1243,13 +1251,17 @@ if c_chantier:
     FILTRES["f_chantier"] = "Chantier"
 
 
+_COLS_FILTRES = list(dict.fromkeys(FILTRES.values()))
+_COMBOS = df[_COLS_FILTRES].astype(str).drop_duplicates()
+
+
 def options_possibles(cle):
-    sub = df
+    sub = _COMBOS
     for k, col in FILTRES.items():
         choisi = st.session_state.get(k) or []
         if k != cle and choisi:
             sub = sub[sub[col].isin(choisi)]
-    return sorted(sub[FILTRES[cle]].astype(str).unique(), key=str)
+    return sorted(sub[FILTRES[cle]].unique(), key=str)
 
 
 for _ in range(3):
@@ -1299,6 +1311,10 @@ def fmt(x):
 
 # ---------- Bons de commande : situation et alertes ----------
 bcs = charge_bc()
+# Le curseur du seuil est dans l'onglet « Bons de commande » : on garde sa valeur même quand
+# cet onglet n'est pas affiché (sinon Streamlit l'oublierait).
+if "bc_seuil" in st.session_state:
+    st.session_state["bc_seuil"] = st.session_state["bc_seuil"]
 seuil_alerte = int(st.session_state.get("bc_seuil", 80))
 
 # Calcul sur les données filtrées f
@@ -1391,7 +1407,8 @@ def afficher(cle, croise=None):
 
 
 n_alertes = n_rouge + n_jaune + n_rouge_pl + n_jaune_pl
-TAB_ALERTES = f"🚨 Alertes ({n_alertes})" if n_alertes else "🚨 Alertes"
+TAB_ALERTES = "🚨 Alertes"  # clé stable ; le compteur est ajouté à l'affichage seulement
+LIBELLE_ALERTES = f"🚨 Alertes ({n_alertes})" if n_alertes else "🚨 Alertes"
 noms_onglets = [TAB_ALERTES, "📅 Par mois", "📆 Par jour", "🏭 Par carrière", "👥 Par client",
                 "🪨 Par produit"]
 if c_chantier:
@@ -1400,9 +1417,24 @@ noms_onglets.append("📑 Bons de commande")
 noms_onglets.append("💰 Plafond par client")
 noms_onglets.append("🧾 Règlement client")
 noms_onglets.append("📋 Détail")
-onglets = dict(zip(noms_onglets, st.tabs(noms_onglets)))
 
-with onglets[TAB_ALERTES]:
+
+def _libelle_onglet(n):
+    return LIBELLE_ALERTES if n == TAB_ALERTES else n
+
+
+# Seul l'onglet sélectionné est calculé et affiché (beaucoup plus rapide que st.tabs,
+# qui recalcule et envoie le contenu de tous les onglets à chaque action).
+if hasattr(st, "segmented_control"):
+    actif = st.segmented_control("Section", noms_onglets, default=noms_onglets[0],
+                                 format_func=_libelle_onglet, key="onglet_actif",
+                                 label_visibility="collapsed")
+else:
+    actif = st.radio("Section", noms_onglets, horizontal=True, format_func=_libelle_onglet,
+                     key="onglet_actif", label_visibility="collapsed")
+actif = actif or noms_onglets[0]
+
+if actif == TAB_ALERTES:
     type_alerte = st.radio("Alertes par rapport à", ["📑 Bons de commande", "💰 Plafond par client"],
                            horizontal=True, key="type_alerte")
     if type_alerte.startswith("📑"):
@@ -1442,24 +1474,24 @@ with onglets[TAB_ALERTES]:
             else:
                 st.dataframe(colorie(alertes_pl), use_container_width=True, hide_index=True)
 
-with onglets["📅 Par mois"]:
+if actif == "📅 Par mois":
     afficher("Mois")
-with onglets["📆 Par jour"]:
+if actif == "📆 Par jour":
     afficher("Jour")
-with onglets["🏭 Par carrière"]:
+if actif == "🏭 Par carrière":
     afficher("Carrière", "Mois")
     st.markdown("**Dernier jour reçu par carrière**")
     dern = (f.groupby("Carrière").agg(Dernier_jour=("Jour", "max"), Jours_renseignés=("Jour", "nunique"))
             .reset_index())
     st.dataframe(dern, use_container_width=True, hide_index=True)
-with onglets["👥 Par client"]:
+if actif == "👥 Par client":
     afficher(c_client, "Mois")
-with onglets["🪨 Par produit"]:
+if actif == "🪨 Par produit":
     afficher(c_produit, "Client")
 if c_chantier:
-    with onglets["🏗️ Par chantier"]:
+    if actif == "🏗️ Par chantier":
         afficher("Chantier", "Mois")
-with onglets["📑 Bons de commande"]:
+if actif == "📑 Bons de commande":
     st.caption("Pour chaque bon de commande, le montant livré (Montant HT des livraisons du "
                "client) est comparé au montant HT du bon selon les filtres sélectionnés. "
                "Un bon peut être limité à un chantier et/ou à un produit.")
@@ -1554,7 +1586,7 @@ with onglets["📑 Bons de commande"]:
                     st.button("Oui, supprimer", key=f"bc_del_{bid}", on_click=cb_bc_supprime,
                               args=(bid,))
 
-with onglets["💰 Plafond par client"]:
+if actif == "💰 Plafond par client":
     st.caption("Fixez un montant plafond (HT) par client : il est comparé au Montant HT Net livré "
                "au client, selon les filtres sélectionnés, sur toute la période ou sur une période "
                "limitée (du … au …). Les règlements du client (saisis en TTC dans l'onglet « Règlement "
@@ -1606,7 +1638,7 @@ with onglets["💰 Plafond par client"]:
                 cible = st.selectbox("Client", sorted(pl), key="pl_del")
                 st.button("Supprimer ce plafond", on_click=cb_pl_supprime, args=(cible,))
 
-with onglets["🧾 Règlement client"]:
+if actif == "🧾 Règlement client":
     st.caption(f"**Plafond TTC = Plafond HT × {TVA:.2f}** · **Livré TTC = Livré HT Net × {TVA:.2f}** "
                f"(sur la période du plafond, selon les filtres). **Reste plafond (TTC) = Plafond TTC "
                f"− Livré TTC + Règlements TTC** : chaque règlement reconstitue le plafond du client. "
@@ -1697,73 +1729,94 @@ with onglets["🧾 Règlement client"]:
                 cl_del = det.loc[det["id"] == rid, "Client"].iloc[0]
                 st.button("Supprimer ce règlement", on_click=cb_rg_supprime, args=(cl_del, rid))
 
-with onglets["📋 Détail"]:
-    st.dataframe(f, use_container_width=True)
+if actif == "📋 Détail":
+    MAX_LIGNES = 2000
+    if len(f) > MAX_LIGNES:
+        st.caption(f"Affichage des {MAX_LIGNES:,} premières lignes sur {len(f):,} (pour garder "
+                   f"l'application rapide). Affinez les filtres ou utilisez l'export Excel pour "
+                   f"obtenir toutes les lignes.".replace(",", " "))
+        if st.checkbox("Afficher toutes les lignes (peut être lent)", key="detail_tout"):
+            st.dataframe(f, use_container_width=True)
+        else:
+            st.dataframe(f.head(MAX_LIGNES), use_container_width=True)
+    else:
+        st.dataframe(f, use_container_width=True)
 
 # =====================================================================
 # 3) EXPORT EXCEL COMPLET (CONFORME AUX TABLEAUX ET IMPRIMABLE EN A4 PAYSAGE)
 # =====================================================================
-buf = io.BytesIO()
-with pd.ExcelWriter(buf, engine="openpyxl") as w:
-    # 1. Détail filtré
-    f.to_excel(w, sheet_name="Détail", index=False)
+def construire_export():
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        # 1. Détail filtré
+        f.to_excel(w, sheet_name="Détail", index=False)
     
-    # 2. Synthèses simples & croisées
-    _, t_mois, _ = get_tableau_complet("Mois")
-    t_mois.to_excel(w, sheet_name="Par mois", index=False)
+        # 2. Synthèses simples & croisées
+        _, t_mois, _ = get_tableau_complet("Mois")
+        t_mois.to_excel(w, sheet_name="Par mois", index=False)
     
-    _, t_jour, _ = get_tableau_complet("Jour")
-    t_jour.to_excel(w, sheet_name="Par jour", index=False)
+        _, t_jour, _ = get_tableau_complet("Jour")
+        t_jour.to_excel(w, sheet_name="Par jour", index=False)
     
-    _, t_car, c_car = get_tableau_complet("Carrière", "Mois")
-    t_car.to_excel(w, sheet_name="Par carrière", index=False)
-    if c_car is not None:
-        c_car.to_excel(w, sheet_name="Carrière x Mois", index=False)
+        _, t_car, c_car = get_tableau_complet("Carrière", "Mois")
+        t_car.to_excel(w, sheet_name="Par carrière", index=False)
+        if c_car is not None:
+            c_car.to_excel(w, sheet_name="Carrière x Mois", index=False)
         
-    _, t_cli, c_cli = get_tableau_complet(c_client, "Mois")
-    t_cli.to_excel(w, sheet_name="Par client", index=False)
-    if c_cli is not None:
-        c_cli.to_excel(w, sheet_name="Client x Mois", index=False)
+        _, t_cli, c_cli = get_tableau_complet(c_client, "Mois")
+        t_cli.to_excel(w, sheet_name="Par client", index=False)
+        if c_cli is not None:
+            c_cli.to_excel(w, sheet_name="Client x Mois", index=False)
         
-    _, t_prod, c_prod = get_tableau_complet(c_produit, "Client")
-    t_prod.to_excel(w, sheet_name="Par produit", index=False)
-    if c_prod is not None:
-        c_prod.to_excel(w, sheet_name="Produit x Client", index=False)
+        _, t_prod, c_prod = get_tableau_complet(c_produit, "Client")
+        t_prod.to_excel(w, sheet_name="Par produit", index=False)
+        if c_prod is not None:
+            c_prod.to_excel(w, sheet_name="Produit x Client", index=False)
         
-    if c_chantier:
-        _, t_cha, c_cha = get_tableau_complet("Chantier", "Mois")
-        t_cha.to_excel(w, sheet_name="Par chantier", index=False)
-        if c_cha is not None:
-            c_cha.to_excel(w, sheet_name="Chantier x Mois", index=False)
+        if c_chantier:
+            _, t_cha, c_cha = get_tableau_complet("Chantier", "Mois")
+            t_cha.to_excel(w, sheet_name="Par chantier", index=False)
+            if c_cha is not None:
+                c_cha.to_excel(w, sheet_name="Chantier x Mois", index=False)
             
-    # 3. Situation des Bons de Commande et Alertes
-    if not sit.empty:
-        sit.drop(columns=["id"], errors="ignore").to_excel(w, sheet_name="Bons de commande", index=False)
-        alertes_exp = sit[sit["Statut"].isin([STATUT_DEPASSE, STATUT_PROCHE])].drop(columns=["id"], errors="ignore")
-        if not alertes_exp.empty:
-            alertes_exp.to_excel(w, sheet_name="Alertes", index=False)
+        # 3. Situation des Bons de Commande et Alertes
+        if not sit.empty:
+            sit.drop(columns=["id"], errors="ignore").to_excel(w, sheet_name="Bons de commande", index=False)
+            alertes_exp = sit[sit["Statut"].isin([STATUT_DEPASSE, STATUT_PROCHE])].drop(columns=["id"], errors="ignore")
+            if not alertes_exp.empty:
+                alertes_exp.to_excel(w, sheet_name="Alertes", index=False)
 
-    if not sp.empty:
-        sp.to_excel(w, sheet_name="Plafond par client", index=False)
-        alertes_pl_exp = sp[sp["Statut"].isin([STATUT_DEPASSE, STATUT_PROCHE])]
-        if not alertes_pl_exp.empty:
-            alertes_pl_exp.to_excel(w, sheet_name="Alertes plafond", index=False)
-        sr.to_excel(w, sheet_name="Règlement client", index=False)
-        det_exp = detail_reglements(rg).drop(columns=["id"])
-        if not det_exp.empty:
-            det_exp.to_excel(w, sheet_name="Historique règlements", index=False)
+        if not sp.empty:
+            sp.to_excel(w, sheet_name="Plafond par client", index=False)
+            alertes_pl_exp = sp[sp["Statut"].isin([STATUT_DEPASSE, STATUT_PROCHE])]
+            if not alertes_pl_exp.empty:
+                alertes_pl_exp.to_excel(w, sheet_name="Alertes plafond", index=False)
+            sr.to_excel(w, sheet_name="Règlement client", index=False)
+            det_exp = detail_reglements(rg).drop(columns=["id"])
+            if not det_exp.empty:
+                det_exp.to_excel(w, sheet_name="Historique règlements", index=False)
 
-    # 4. Application de la mise en page (A4, Paysage, Ajusté à la largeur) sur chaque feuille
-    for ws in w.sheets.values():
-        ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
-        ws.page_setup.paperSize = ws.PAPERSIZE_A4
-        ws.page_setup.fitToPage = True
-        ws.page_setup.fitToWidth = 1
-        ws.page_setup.fitToHeight = 0
-        ws.sheet_properties.pageSetUpPr.fitToPage = True
-        # Répétition de la première ligne (en-têtes) sur toutes les pages imprimées
-        ws.print_title_rows = '1:1'
+        # 4. Application de la mise en page (A4, Paysage, Ajusté à la largeur) sur chaque feuille
+        for ws in w.sheets.values():
+            ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+            ws.page_setup.paperSize = ws.PAPERSIZE_A4
+            ws.page_setup.fitToPage = True
+            ws.page_setup.fitToWidth = 1
+            ws.page_setup.fitToHeight = 0
+            ws.sheet_properties.pageSetUpPr.fitToPage = True
+            # Répétition de la première ligne (en-têtes) sur toutes les pages imprimées
+            ws.print_title_rows = '1:1'
+    return buf.getvalue()
 
-st.download_button("⬇️ Exporter la sélection (Excel)", buf.getvalue(),
-                   file_name=f"livraisons_filtrees_{datetime.now():%Y%m%d_%H%M}.xlsx",
-                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+_signature = (len(f), round(float(f["Montant HT Net"].sum()), 2), ind)
+if st.button("📦 Préparer l'export Excel de la sélection"):
+    with st.spinner("Génération du fichier Excel…"):
+        st.session_state["export_xlsx"] = (_signature, construire_export())
+_exp = st.session_state.get("export_xlsx")
+if _exp and _exp[0] == _signature:
+    st.download_button("⬇️ Télécharger l'export (Excel)", _exp[1],
+                       file_name=f"livraisons_filtrees_{datetime.now():%Y%m%d_%H%M}.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+elif _exp:
+    st.caption("Les filtres ont changé : cliquez de nouveau sur « Préparer l'export Excel ».")
