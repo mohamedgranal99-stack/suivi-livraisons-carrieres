@@ -6,6 +6,7 @@ import os
 import re
 import secrets as pysecrets
 import time
+import uuid
 import zipfile
 from pathlib import Path
 from datetime import datetime
@@ -728,7 +729,9 @@ def colorie(d):
     d = d.drop(columns=["id"], errors="ignore")
     formats = {"Montant BC (HT)": "{:,.2f}", "Livré (HT)": "{:,.2f}", "Reste": "{:,.2f}",
                "Dépassement": "{:,.2f}", "% consommé": "{:.0f} %", "Qté livrée": "{:,.2f}",
-               "Plafond (HT)": "{:,.2f}"}
+               "Plafond (HT)": "{:,.2f}", "Plafond TTC": "{:,.2f}",
+               "Total réglé (TTC)": "{:,.2f}", "Reste plafond (TTC)": "{:,.2f}",
+               "Montant TTC": "{:,.2f}"}
     try:
         return (d.style.apply(lambda r: [COULEURS_STATUT.get(r["Statut"], "")] * len(r), axis=1)
                 .format({k: v for k, v in formats.items() if k in d.columns}, na_rep=""))
@@ -842,6 +845,92 @@ def situation_plafonds(base, plafonds, seuil):
                        "Reste": max(plafond - livre, 0.0), "Dépassement": max(livre - plafond, 0.0),
                        "% consommé": round(pct, 1), "Statut": statut, "Note": p.get("note", "")})
     return pd.DataFrame(lignes, columns=colonnes)
+
+
+# ---------- Règlements clients (montants TTC déduits du plafond TTC) ----------
+TVA = 1.20  # Plafond TTC = Plafond HT × 1,20
+MODES_REGLEMENT = ["Virement", "Chèque", "Espèces", "Effet", "Autre"]
+
+
+def charge_reglements():
+    d = kv_get("reglements", {})
+    return d if isinstance(d, dict) else {}
+
+
+def cb_rg_ajoute():
+    ss = st.session_state
+    client = ss.get("rg_client")
+    montant = float(ss.get("rg_montant") or 0)
+    if not client:
+        msg("error", "Choisissez le client.")
+    elif montant <= 0:
+        msg("error", "Le montant du règlement (TTC) doit être supérieur à 0.")
+    else:
+        d = charge_reglements()
+        d.setdefault(client, []).append({
+            "id": uuid.uuid4().hex[:8], "date": date_iso(ss.get("rg_date")), "montant_ttc": montant,
+            "mode": ss.get("rg_mode") or "", "ref": (ss.get("rg_ref") or "").strip(),
+            "note": (ss.get("rg_note") or "").strip(), "saisi_par": moi() or "",
+            "saisi_le": datetime.now().isoformat(timespec="seconds")})
+        kv_set("reglements", d)
+        ss["rg_montant"], ss["rg_ref"], ss["rg_note"] = 0.0, "", ""
+        msg("success", f"Règlement de {montant:,.2f} Dh TTC enregistré pour « {client} ».")
+
+
+def cb_rg_supprime(client, rid):
+    d = charge_reglements()
+    avant = len(d.get(client, []))
+    d[client] = [r for r in d.get(client, []) if r.get("id") != rid]
+    if not d[client]:
+        del d[client]
+    if avant != len(d.get(client, [])):
+        kv_set("reglements", d)
+        msg("success", "Règlement supprimé.")
+
+
+def _reglements_periode(liste, p):
+    d1, d2 = p.get("date_debut"), p.get("date_fin")
+    return [r for r in liste
+            if (not d1 or (r.get("date") or "") >= d1) and (not d2 or (r.get("date") or "") <= d2)]
+
+
+def situation_reglements(plafonds, reglements, seuil):
+    """Compare le total des règlements (TTC) au plafond client converti en TTC (HT × 1,20)."""
+    colonnes = ["Client", "Période", "Plafond (HT)", "Plafond TTC", "Total réglé (TTC)",
+                "Reste plafond (TTC)", "Dépassement", "% consommé", "Statut", "Nb règlements"]
+    lignes = []
+    for client, p in plafonds.items():
+        plafond_ht = float(p.get("montant", 0))
+        plafond_ttc = round(plafond_ht * TVA, 2)
+        regs = _reglements_periode(reglements.get(client, []), p)
+        regle = round(sum(float(r.get("montant_ttc", 0)) for r in regs), 2)
+        d1, d2 = p.get("date_debut"), p.get("date_fin")
+        periode = ("toute la période" if not (d1 or d2) else
+                   f"{_fr(d1) if d1 else '…'} → {_fr(d2) if d2 else '…'}")
+        pct = regle / plafond_ttc * 100 if plafond_ttc > 0 else 0.0
+        if round(regle, 2) >= round(plafond_ttc, 2):
+            statut = STATUT_DEPASSE
+        elif pct >= seuil:
+            statut = STATUT_PROCHE
+        else:
+            statut = STATUT_OK
+        lignes.append({"Client": client, "Période": periode, "Plafond (HT)": plafond_ht,
+                       "Plafond TTC": plafond_ttc, "Total réglé (TTC)": regle,
+                       "Reste plafond (TTC)": max(plafond_ttc - regle, 0.0),
+                       "Dépassement": max(regle - plafond_ttc, 0.0), "% consommé": round(pct, 1),
+                       "Statut": statut, "Nb règlements": len(regs)})
+    return pd.DataFrame(lignes, columns=colonnes)
+
+
+def detail_reglements(reglements):
+    lignes = [{"id": r.get("id"), "Date": r.get("date") or "", "Client": client,
+               "Montant TTC": float(r.get("montant_ttc", 0)), "Mode": r.get("mode", ""),
+               "Référence": r.get("ref", ""), "Note": r.get("note", ""),
+               "Saisi par": r.get("saisi_par", "")}
+              for client, liste in reglements.items() for r in liste]
+    d = pd.DataFrame(lignes, columns=["id", "Date", "Client", "Montant TTC", "Mode", "Référence",
+                                      "Note", "Saisi par"])
+    return d.sort_values("Date", ascending=False).reset_index(drop=True)
 
 
 # =====================================================================
@@ -1162,6 +1251,8 @@ seuil_alerte = int(st.session_state.get("bc_seuil", 80))
 sit = calcule_situation(f, bcs, seuil_alerte)
 pl = charge_plafonds()
 sp = situation_plafonds(f, pl, seuil_alerte)
+rg = charge_reglements()
+sr = situation_reglements(pl, rg, seuil_alerte)
 n_rouge = n_jaune = 0
 n_rouge_pl = n_jaune_pl = 0
 if not sit.empty:
@@ -1253,6 +1344,7 @@ if c_chantier:
     noms_onglets.append("🏗️ Par chantier")
 noms_onglets.append("📑 Bons de commande")
 noms_onglets.append("💰 Plafond par client")
+noms_onglets.append("🧾 Règlement client")
 noms_onglets.append("📋 Détail")
 onglets = dict(zip(noms_onglets, st.tabs(noms_onglets)))
 
@@ -1458,6 +1550,67 @@ with onglets["💰 Plafond par client"]:
                 cible = st.selectbox("Client", sorted(pl), key="pl_del")
                 st.button("Supprimer ce plafond", on_click=cb_pl_supprime, args=(cible,))
 
+with onglets["🧾 Règlement client"]:
+    st.caption(f"Chaque règlement (montant **TTC**) est déduit du plafond du client converti en TTC : "
+               f"**Plafond TTC = Plafond HT × {TVA:.2f}**. Si le plafond a une période, seuls les "
+               f"règlements datés dans cette période sont déduits. Le seuil d'alerte est celui de "
+               f"l'onglet « Bons de commande ».")
+    if not pl:
+        st.info("Aucun plafond client défini : définissez d'abord un plafond dans l'onglet "
+                "« Plafond par client ».")
+    else:
+        r_rg = int((sr["Statut"] == STATUT_DEPASSE).sum())
+        j_rg = int((sr["Statut"] == STATUT_PROCHE).sum())
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Plafond total TTC (Dh)", fmt(sr["Plafond TTC"].sum()))
+        m2.metric("Total réglé TTC (Dh)", fmt(sr["Total réglé (TTC)"].sum()))
+        m3.metric("Reste du plafond TTC (Dh)", fmt(sr["Reste plafond (TTC)"].sum()))
+        m4.metric("🔴 Atteint / 🟡 au seuil", f"{r_rg} / {j_rg}")
+        st.dataframe(colorie(sr.sort_values("% consommé", ascending=False)),
+                     use_container_width=True, hide_index=True)
+
+    det = detail_reglements(rg)
+    with st.expander(f"📜 Historique des règlements ({len(det)})", expanded=not det.empty):
+        if det.empty:
+            st.info("Aucun règlement enregistré.")
+        else:
+            filtre_cl = st.multiselect("Filtrer par client", sorted(det["Client"].unique(), key=str),
+                                       key="rg_filtre")
+            vue = det[det["Client"].isin(filtre_cl)] if filtre_cl else det
+            aff = vue.drop(columns=["id"]).copy()
+            aff["Date"] = aff["Date"].map(lambda x: _fr(x) if x else "")
+            st.dataframe(aff.style.format({"Montant TTC": "{:,.2f}"}),
+                         use_container_width=True, hide_index=True)
+            st.caption(f"Total affiché : **{fmt(vue['Montant TTC'].sum())} Dh TTC**")
+
+    if est_admin and pl:
+        with st.expander("➕ Ajouter un règlement", expanded=det.empty):
+            client_rg = st.selectbox("Client (avec plafond)", sorted(pl, key=str), key="rg_client")
+            ligne_c = sr[sr["Client"] == client_rg].iloc[0]
+            st.info(f"Plafond TTC : **{fmt(ligne_c['Plafond TTC'])} Dh** (HT {fmt(ligne_c['Plafond (HT)'])} "
+                    f"× {TVA:.2f}) · déjà réglé : **{fmt(ligne_c['Total réglé (TTC)'])} Dh** · "
+                    f"reste : **{fmt(ligne_c['Reste plafond (TTC)'])} Dh**")
+            g1, g2 = st.columns(2)
+            g1.date_input("Date du règlement", value=datetime.now().date(), key="rg_date")
+            g2.number_input("Montant du règlement TTC (Dh)", min_value=0.0, step=1000.0,
+                            format="%.2f", key="rg_montant")
+            g3, g4 = st.columns(2)
+            g3.selectbox("Mode de règlement", MODES_REGLEMENT, key="rg_mode")
+            g4.text_input("Référence (n° chèque, virement…)", key="rg_ref")
+            st.text_input("Note (optionnel)", key="rg_note")
+            apres = float(ligne_c["Reste plafond (TTC)"]) - float(st.session_state.get("rg_montant") or 0)
+            if apres < 0:
+                st.warning(f"⚠️ Ce règlement dépasse le plafond TTC de {fmt(-apres)} Dh.")
+            st.button("Enregistrer le règlement", type="primary", on_click=cb_rg_ajoute)
+        if not det.empty:
+            with st.expander("🗑️ Supprimer un règlement"):
+                libelles = {r["id"]: (f"{_fr(r['Date']) if r['Date'] else '—'} · {r['Client']} · "
+                                      f"{r['Montant TTC']:,.2f} Dh · {r['Mode']} {r['Référence']}")
+                            for _, r in det.iterrows()}
+                rid = st.selectbox("Règlement", list(libelles), format_func=libelles.get, key="rg_del")
+                cl_del = det.loc[det["id"] == rid, "Client"].iloc[0]
+                st.button("Supprimer ce règlement", on_click=cb_rg_supprime, args=(cl_del, rid))
+
 with onglets["📋 Détail"]:
     st.dataframe(f, use_container_width=True)
 
@@ -1509,6 +1662,10 @@ with pd.ExcelWriter(buf, engine="openpyxl") as w:
         alertes_pl_exp = sp[sp["Statut"].isin([STATUT_DEPASSE, STATUT_PROCHE])]
         if not alertes_pl_exp.empty:
             alertes_pl_exp.to_excel(w, sheet_name="Alertes plafond", index=False)
+        sr.to_excel(w, sheet_name="Règlement client", index=False)
+        det_exp = detail_reglements(rg).drop(columns=["id"])
+        if not det_exp.empty:
+            det_exp.to_excel(w, sheet_name="Historique règlements", index=False)
 
     # 4. Application de la mise en page (A4, Paysage, Ajusté à la largeur) sur chaque feuille
     for ws in w.sheets.values():
