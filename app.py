@@ -728,6 +728,7 @@ def cb_bc_supprime(bid):
 def colorie(d):
     d = d.drop(columns=["id"], errors="ignore")
     formats = {"Montant BC (HT)": "{:,.2f}", "Livré (HT)": "{:,.2f}", "Reste": "{:,.2f}",
+               "Réglé (TTC)": "{:,.2f}", "Réglé (HT)": "{:,.2f}",
                "Dépassement": "{:,.2f}", "% consommé": "{:.0f} %", "Qté livrée": "{:,.2f}",
                "Plafond (HT)": "{:,.2f}", "Plafond TTC": "{:,.2f}",
                "Total réglé (TTC)": "{:,.2f}", "Reste plafond (TTC)": "{:,.2f}", "Livré TTC": "{:,.2f}",
@@ -818,9 +819,12 @@ def cb_pl_supprime(client):
         msg("success", f"Plafond de « {client} » supprimé.")
 
 
-def situation_plafonds(base, plafonds, seuil):
-    colonnes = ["Client", "Période", "Plafond (HT)", "Livré (HT)", "Reste", "Dépassement",
-                "% consommé", "Statut", "Note"]
+def situation_plafonds(base, plafonds, seuil, reglements=None):
+    """Plafond (HT) comparé au livré HT Net, diminué des règlements du client.
+    Réglé (HT) = Réglé (TTC) / 1,20 ; Reste = Plafond − Livré + Réglé (HT)."""
+    reglements = reglements or {}
+    colonnes = ["Client", "Période", "Plafond (HT)", "Livré (HT)", "Réglé (TTC)", "Réglé (HT)",
+                "Reste", "Dépassement", "% consommé", "Statut", "Note"]
     lignes = []
     for client, p in plafonds.items():
         plafond = float(p.get("montant", 0))
@@ -831,18 +835,21 @@ def situation_plafonds(base, plafonds, seuil):
         if d2:
             sub = sub[sub["Jour"] <= d2]
         livre = float(sub["Montant HT Net"].sum())
+        regle_ttc = round(sum(float(r.get("montant_ttc", 0)) for r in reglements.get(client, [])), 2)
+        regle_ht = round(regle_ttc / TVA, 2)
+        encours = livre - regle_ht  # part du plafond encore consommée (livré non réglé)
         periode = ("toute la période" if not (d1 or d2) else
                    f"{_fr(d1) if d1 else '…'} → {_fr(d2) if d2 else '…'}")
-        pct = livre / plafond * 100 if plafond > 0 else 0.0
-        if round(livre, 2) >= round(plafond, 2):
+        pct = max(encours, 0.0) / plafond * 100 if plafond > 0 else 0.0
+        if round(encours, 2) >= round(plafond, 2):
             statut = STATUT_DEPASSE
         elif pct >= seuil:
             statut = STATUT_PROCHE
         else:
             statut = STATUT_OK
         lignes.append({"Client": client, "Période": periode, "Plafond (HT)": plafond,
-                       "Livré (HT)": livre,
-                       "Reste": max(plafond - livre, 0.0), "Dépassement": max(livre - plafond, 0.0),
+                       "Livré (HT)": livre, "Réglé (TTC)": regle_ttc, "Réglé (HT)": regle_ht,
+                       "Reste": max(plafond - encours, 0.0), "Dépassement": max(encours - plafond, 0.0),
                        "% consommé": round(pct, 1), "Statut": statut, "Note": p.get("note", "")})
     return pd.DataFrame(lignes, columns=colonnes)
 
@@ -1285,8 +1292,8 @@ seuil_alerte = int(st.session_state.get("bc_seuil", 80))
 # Calcul sur les données filtrées f
 sit = calcule_situation(f, bcs, seuil_alerte)
 pl = charge_plafonds()
-sp = situation_plafonds(f, pl, seuil_alerte)
 rg = charge_reglements()
+sp = situation_plafonds(f, pl, seuil_alerte, rg)
 sr = situation_reglements(f, pl, rg, seuil_alerte)
 n_rouge = n_jaune = 0
 n_rouge_pl = n_jaune_pl = 0
@@ -1538,7 +1545,9 @@ with onglets["📑 Bons de commande"]:
 with onglets["💰 Plafond par client"]:
     st.caption("Fixez un montant plafond (HT) par client : il est comparé au Montant HT Net livré "
                "au client, selon les filtres sélectionnés, sur toute la période ou sur une période "
-               "limitée (du … au …). Le seuil d'alerte est celui de "
+               "limitée (du … au …). Les règlements du client (saisis en TTC dans l'onglet « Règlement "
+               "client », convertis en HT ÷ 1,20) sont déduits : Reste = Plafond − Livré + Réglé (HT). "
+               "Le seuil d'alerte est celui de "
                "l'onglet « Bons de commande ».")
     if sp.empty:
         st.info("Aucun plafond défini." + (" Ajoutez-en un ci-dessous." if est_admin else ""))
