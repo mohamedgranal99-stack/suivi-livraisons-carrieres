@@ -714,20 +714,29 @@ PROMPT_BC = (
 )
 
 
+def _cherche_cle_gemini(d, parent="", niveau=0):
+    """Cherche la clé Gemini dans les Secrets, à la racine ou dans n'importe quelle section
+    (même imbriquée, ex. [users.admin])."""
+    if niveau > 5 or not hasattr(d, "items"):
+        return None
+    for k, v in d.items():
+        nom = str(k).strip().lower()
+        if isinstance(v, str) and v.strip() and (
+                nom in ("gemini_api_key", "gemini_key")
+                or (nom in ("api_key", "key") and parent.lower() == "gemini")):
+            return v.strip()
+    for k, v in d.items():
+        if hasattr(v, "items"):
+            r = _cherche_cle_gemini(v, str(k), niveau + 1)
+            if r:
+                return r
+    return None
+
+
 def gemini_cle():
-    """Clé API Gemini lue dans les Secrets (jamais écrite dans le code).
-    Cherchée à la racine, puis dans [gemini], puis dans n'importe quelle section."""
-    v = None
+    """Clé API Gemini lue dans les Secrets (jamais écrite dans le code)."""
     try:
-        v = st.secrets.get("GEMINI_API_KEY")
-        if not v:
-            for _, sec in st.secrets.items():
-                if hasattr(sec, "get"):
-                    v = sec.get("GEMINI_API_KEY") or sec.get("gemini_api_key")
-                    if not v and _ == "gemini":
-                        v = sec.get("api_key") or sec.get("key")
-                    if v:
-                        break
+        v = _cherche_cle_gemini(st.secrets)
     except Exception:
         v = None
     return str(v or os.environ.get("GEMINI_API_KEY", "")).strip()
@@ -1715,8 +1724,12 @@ if actif == "📑 Bons de commande":
             with st.container(border=True):
                 st.markdown("**📷 Scanner un bon de commande (IA Gemini)**")
                 if not gemini_cle():
+                    try:
+                        _noms = ", ".join(str(k) for k in st.secrets.keys())
+                    except Exception:
+                        _noms = "?"
                     st.caption("Ajoutez `GEMINI_API_KEY` dans les Secrets de l'application pour "
-                               "activer le scan.")
+                               f"activer le scan. (Sections lues dans les Secrets : {_noms})")
                 else:
                     scan_f = st.file_uploader("Photo ou PDF du bon de commande",
                                               type=["png", "jpg", "jpeg", "webp", "pdf"],
