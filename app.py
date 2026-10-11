@@ -715,11 +715,19 @@ PROMPT_BC = (
 
 
 def gemini_cle():
-    """Clé API Gemini lue dans les Secrets (jamais écrite dans le code)."""
+    """Clé API Gemini lue dans les Secrets (jamais écrite dans le code).
+    Cherchée à la racine, puis dans [gemini], puis dans n'importe quelle section."""
+    v = None
     try:
         v = st.secrets.get("GEMINI_API_KEY")
-        if not v and "gemini" in st.secrets:
-            v = st.secrets["gemini"].get("api_key") or st.secrets["gemini"].get("GEMINI_API_KEY")
+        if not v:
+            for _, sec in st.secrets.items():
+                if hasattr(sec, "get"):
+                    v = sec.get("GEMINI_API_KEY") or sec.get("gemini_api_key")
+                    if not v and _ == "gemini":
+                        v = sec.get("api_key") or sec.get("key")
+                    if v:
+                        break
     except Exception:
         v = None
     return str(v or os.environ.get("GEMINI_API_KEY", "")).strip()
