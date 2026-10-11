@@ -9,6 +9,7 @@ import secrets as pysecrets
 import time
 import uuid
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
 
@@ -115,21 +116,53 @@ def _entetes(extra=None):
 
 
 def sb_lire(table, params=None):
-    """Lit toute une table par pages de 1000 lignes."""
+    """Lit toute une table par pages de 1000 lignes ; les pages suivantes sont lues en parallèle."""
     base, _ = _config()
-    lignes, debut, pas = [], 0, 1000
-    while True:
-        r = requests.get(f"{base}/{table}", params=params, timeout=60,
-                         headers=_entetes({"Range-Unit": "items",
-                                           "Range": f"{debut}-{debut + pas - 1}"}))
+    entetes = _entetes({"Range-Unit": "items"})  # lu ici (thread principal) : pas de st.* dans les threads
+    pas = 1000
+    url = f"{base}/{table}"
+
+    def page(sess, debut, avec_total=False):
+        h = {**entetes, "Range": f"{debut}-{debut + pas - 1}"}
+        if avec_total:
+            h["Prefer"] = "count=exact"
+        return sess.get(url, params=params, timeout=60, headers=h)
+
+    with requests.Session() as sess:
+        sess.mount("https://", requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=8))
+        r = page(sess, 0, avec_total=True)
         if r.status_code == 416:
-            return lignes
+            return []
         r.raise_for_status()
-        lot = r.json()
-        lignes.extend(lot)
-        if len(lot) < pas:
+        lignes = r.json()
+        if len(lignes) < pas:
             return lignes
-        debut += pas
+        cr = r.headers.get("Content-Range", "")
+        total = int(cr.split("/")[1]) if "/" in cr and cr.split("/")[1].isdigit() else None
+        if total is None:  # total inconnu : lecture séquentielle
+            debut = pas
+            while True:
+                r = page(sess, debut)
+                if r.status_code == 416:
+                    return lignes
+                r.raise_for_status()
+                lot = r.json()
+                lignes.extend(lot)
+                if len(lot) < pas:
+                    return lignes
+                debut += pas
+
+        def lire(debut):
+            rr = page(sess, debut)
+            if rr.status_code == 416:
+                return []
+            rr.raise_for_status()
+            return rr.json()
+
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            for lot in ex.map(lire, range(pas, total, pas)):  # ex.map garde l'ordre des pages
+                lignes.extend(lot)
+    return lignes
 
 
 def sb_ecrire(methode, table, params=None, json_=None, extra=None):
@@ -158,7 +191,7 @@ def kv_set(cle, valeur):
     _kv_lire.clear()
 
 
-@st.cache_data(ttl=3600, show_spinner="Chargement des livraisons…")
+@st.cache_data(ttl=6 * 3600, show_spinner="Chargement des livraisons…")
 def charge_livraisons():
     cols = COLS_LIV_BASE + (",montant_ht_brut" if col_ht_existe() else "")
     d = pd.DataFrame(sb_lire(TABLE, {"select": cols, "order": "id"}), columns=cols.split(","))
