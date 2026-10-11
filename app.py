@@ -1,4 +1,5 @@
 import difflib
+import unicodedata
 import hashlib
 import hmac
 import io
@@ -853,25 +854,54 @@ def _proche(nom, options):
     return bas[m[0]] if m else None
 
 
+NOUVEAU_CLIENT = "➕ Autre client (absent des livraisons)"
+MOTS_VIDES = {"entreprise", "ste", "societe", "sarl", "sa", "au", "travaux", "btp", "de", "du",
+              "des", "et", "la", "le", "el", "al", "ben", "ets", "etablissements", "groupe",
+              "construction", "batiment", "commerce", "general", "generale", "services",
+              "service", "trans", "transport", "carriere", "materiaux", "mat", "cie", "company"}
+
+
+def _jetons(texte):
+    """Mots distinctifs d'un nom (sans accents, sans « société », « sarl », « travaux »…)."""
+    t = unicodedata.normalize("NFKD", str(texte or "")).encode("ascii", "ignore").decode().lower()
+    return [w for w in re.sub(r"[^a-z0-9]+", " ", t).split() if len(w) >= 3 and w not in MOTS_VIDES]
+
+
+def _proche_client(nom, options):
+    """Client connu correspondant au nom lu, ou None. Strict : tous les mots distinctifs du plus
+    court des deux noms doivent se retrouver (à une petite faute d'orthographe près) dans l'autre."""
+    a = _jetons(nom)
+    if not a:
+        return None
+    meilleur, score_max = None, 0.0
+    for o in options:
+        b = _jetons(o)
+        if not b:
+            continue
+        court, long_ = (a, b) if len(a) <= len(b) else (b, a)
+        ratios = [max(difflib.SequenceMatcher(None, w, x).ratio() for x in long_) for w in court]
+        if min(ratios) >= 0.82 and sum(ratios) > score_max:
+            meilleur, score_max = o, sum(ratios)
+    return meilleur
+
+
 def prepare_prefill(data, donnees):
     """Rapproche le résultat du scan des clients / produits / chantiers connus."""
     clients_connus = sorted(donnees["Client"].unique(), key=str)
-    client = _proche(data.get("client"), clients_connus)
+    client = _proche_client(data.get("client"), clients_connus)
     produits, inconnus, chantier = {}, [], None
+    # client connu : produits de ce client ; client nouveau : tous les produits connus
+    sous = donnees[donnees["Client"] == client] if client else donnees
+    prods_connus = sorted(sous["Produit"].unique(), key=str)
+    for p in data.get("produits") or []:
+        nom = _proche(p.get("designation"), prods_connus)
+        if nom:
+            produits[nom] = produits.get(nom, 0.0) + float(p.get("montant_ht") or 0)
+        elif p.get("designation"):
+            inconnus.append(p["designation"])
     if client:
-        sous = donnees[donnees["Client"] == client]
-        prods_connus = sorted(sous["Produit"].unique(), key=str)
-        for p in data.get("produits") or []:
-            nom = _proche(p.get("designation"), prods_connus)
-            if nom:
-                produits[nom] = produits.get(nom, 0.0) + float(p.get("montant_ht") or 0)
-            elif p.get("designation"):
-                inconnus.append(p["designation"])
-        ch = _proche(data.get("chantier"), [c for c in sous["Chantier"].unique()
-                                            if c != "(non renseigné)"])
-        chantier = ch
-    else:
-        inconnus = [p["designation"] for p in data.get("produits") or [] if p.get("designation")]
+        chantier = _proche(data.get("chantier"), [c for c in sous["Chantier"].unique()
+                                                  if c != "(non renseigné)"])
     return {"ref": (data.get("reference") or "").strip(), "client_lu": data.get("client") or "",
             "client": client, "chantier": chantier, "chantier_lu": data.get("chantier") or "",
             "montant": float(data.get("montant_total_ht") or 0), "note": (data.get("note") or "").strip(),
@@ -888,6 +918,9 @@ def cb_applique_scan():
     if sc.get("note"):
         ss["bc_note"] = sc["note"]
     c = sc.get("client")
+    if not c and sc.get("client_lu"):  # client absent des livraisons : création d'un nouveau client
+        c = NOUVEAU_CLIENT
+        ss["bc_client_nouveau"] = sc["client_lu"].strip()
     if c:
         ss["bc_client"] = c
         ss[f"bc_produits_{c}"] = list(sc.get("produits", {}))
@@ -903,7 +936,7 @@ def _bc_valide(ref, client, montant, periode, d1, d2, autres, ignorer_id=None, p
     if not ref:
         return "Saisissez la référence du bon de commande."
     if not client:
-        return "Choisissez le client."
+        return "Choisissez le client (ou saisissez le nom du nouveau client)."
     if montant <= 0:
         return "Le montant HT doit être supérieur à 0."
     if any(b["ref"].lower() == ref.lower() and b["id"] != ignorer_id for b in autres):
@@ -921,9 +954,11 @@ def cb_bc_ajoute():
     ss = st.session_state
     bcs = charge_bc()
     ref = (ss.get("bc_ref") or "").strip()
-    client = ss.get("bc_client")
-    chantier = ss.get(f"bc_chantier_{client}")
-    produits = _lit_produits(f"bc_produits_{client}", f"bc_pm_{client}_")
+    client_sel = ss.get("bc_client")
+    client = ((ss.get("bc_client_nouveau") or "").strip() if client_sel == NOUVEAU_CLIENT
+              else client_sel)
+    chantier = ss.get(f"bc_chantier_{client_sel}")
+    produits = _lit_produits(f"bc_produits_{client_sel}", f"bc_pm_{client_sel}_")
     montant = float(ss.get("bc_montant") or 0)
     periode = bool(ss.get("bc_periode"))
     d1, d2 = (ss.get("bc_d1"), ss.get("bc_d2")) if periode else (None, None)
@@ -944,7 +979,9 @@ def cb_bc_ajoute():
         return
     bc_msg("success", f"Bon de commande « {ref} » enregistré ({fmt_dh(montant)} Dh HT).")
     ss["bc_ref"], ss["bc_montant"], ss["bc_note"] = "", 0.0, ""
-    ss[f"bc_produits_{client}"] = []
+    ss[f"bc_produits_{client_sel}"] = []
+    if client_sel == NOUVEAU_CLIENT:
+        ss["bc_client_nouveau"] = ""
 
 
 def cb_bc_modifie(bid):
@@ -1809,11 +1846,18 @@ if actif == "📑 Bons de commande":
                     st.caption("Ajoutez `GEMINI_API_KEY` dans les Secrets de l'application pour "
                                f"activer le scan. (Sections lues dans les Secrets : {_noms})")
                 else:
-                    scan_f = st.file_uploader("Photo ou PDF du bon de commande",
-                                              type=["png", "jpg", "jpeg", "webp", "pdf"],
-                                              key=f"bc_scan_file_{cle}")
+                    source = st.radio("Source du bon", ["📁 Importer un fichier", "📷 Prendre une photo"],
+                                      horizontal=True, key="bc_scan_source",
+                                      label_visibility="collapsed")
+                    if source.startswith("📷"):
+                        scan_f = st.camera_input("Prenez le bon de commande en photo",
+                                                 key=f"bc_scan_cam_{cle}")
+                    else:
+                        scan_f = st.file_uploader("Photo ou PDF du bon de commande",
+                                                  type=["png", "jpg", "jpeg", "webp", "pdf"],
+                                                  key=f"bc_scan_file_{cle}")
                     if scan_f is not None and st.button("🔍 Scanner ce bon", key="bc_scan_btn"):
-                        ext = os.path.splitext(scan_f.name)[1].lower()
+                        ext = os.path.splitext(getattr(scan_f, "name", "") or "")[1].lower()
                         mime = ("application/pdf" if ext == ".pdf" else
                                 scan_f.type or ("image/png" if ext == ".png" else "image/jpeg"))
                         with st.spinner("Lecture du bon de commande par Gemini…"):
@@ -1829,7 +1873,10 @@ if actif == "📑 Bons de commande":
                                    f"**{sc['client_lu'] or '—'}** · montant HT "
                                    f"**{fmt(sc['montant'])} Dh**")
                         if sc["client"] is None:
-                            st.warning("Client non reconnu parmi vos clients : choisissez-le à la main.")
+                            st.warning(f"Le client « {sc['client_lu']} » n'existe pas dans vos "
+                                       f"livraisons : il sera saisi comme nouveau client. Si c'est un "
+                                       f"client existant écrit autrement, choisissez-le dans la liste "
+                                       f"après le pré-remplissage.")
                         elif sc["client"] != sc["client_lu"]:
                             st.caption(f"Client rapproché de : {sc['client']}")
                         if sc["produits"]:
@@ -1843,14 +1890,19 @@ if actif == "📑 Bons de commande":
             a1, a2 = st.columns(2)
             a1.text_input("Référence du bon de commande client", key="bc_ref",
                           placeholder="ex. BC-2026-0145")
-            client_bc = a2.selectbox("Client", clients_liste, key="bc_client")
+            client_bc = a2.selectbox("Client", clients_liste + [NOUVEAU_CLIENT], key="bc_client")
+            if client_bc == NOUVEAU_CLIENT:
+                st.text_input("Nom du nouveau client (comme il sera écrit dans les livraisons)",
+                              key="bc_client_nouveau")
             a3, a4 = st.columns(2)
             a3.number_input("Montant HT du bon de commande (Dh)", min_value=0.0, step=1000.0,
                             format="%.2f", key="bc_montant")
-            if c_chantier:
+            if c_chantier and client_bc != NOUVEAU_CLIENT:
                 chs = sorted(df.loc[df["Client"] == client_bc, "Chantier"].unique(), key=str)
                 a4.selectbox("Chantier (optionnel)", [TOUS] + chs, key=f"bc_chantier_{client_bc}")
-            prods = sorted(df.loc[df["Client"] == client_bc, "Produit"].unique(), key=str)
+            # client nouveau (sans livraison) : tous les produits connus
+            prods = sorted((df if client_bc == NOUVEAU_CLIENT else df[df["Client"] == client_bc])
+                           ["Produit"].unique(), key=str)
             choisis = st.multiselect("Produits (optionnel : vide = tous les produits)", prods,
                                      key=f"bc_produits_{client_bc}")
             if choisis:
@@ -1886,8 +1938,10 @@ if actif == "📑 Bons de commande":
                     st.selectbox("Chantier", opts_c, key=f"bce_chantier_{bid}",
                                  index=opts_c.index(bc["chantier"]) if bc.get("chantier") in opts_c else 0)
                 actuels = bc_produits(bc)
-                prods = sorted(set(df.loc[df["Client"] == cl_bc, "Produit"].unique())
-                               | {p["produit"] for p in actuels}, key=str)
+                _base_p = df.loc[df["Client"] == cl_bc, "Produit"].unique()
+                if len(_base_p) == 0:  # client sans livraison : tous les produits connus
+                    _base_p = df["Produit"].unique()
+                prods = sorted(set(_base_p) | {p["produit"] for p in actuels}, key=str)
                 choisis_e = st.multiselect("Produits (vide = tous les produits)", prods,
                                            default=[p["produit"] for p in actuels],
                                            key=f"bce_produits_{bid}")
