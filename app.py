@@ -1,3 +1,4 @@
+import difflib
 import hashlib
 import hmac
 import io
@@ -682,6 +683,141 @@ def _lit_produits(prefixe_liste, prefixe_montant):
         m = float(ss.get(f"{prefixe_montant}{p}") or 0)
         out.append({"produit": p, "montant": m if m > 0 else None})
     return out
+
+
+# ---------- Scan d'un bon de commande avec Gemini ----------
+GEMINI_MODELE = "gemini-2.5-flash"
+SCHEMA_BC = {
+    "type": "OBJECT",
+    "properties": {
+        "reference": {"type": "STRING", "nullable": True},
+        "client": {"type": "STRING", "nullable": True},
+        "chantier": {"type": "STRING", "nullable": True},
+        "montant_total_ht": {"type": "NUMBER", "nullable": True},
+        "note": {"type": "STRING", "nullable": True},
+        "produits": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {
+            "designation": {"type": "STRING"},
+            "montant_ht": {"type": "NUMBER", "nullable": True}},
+            "required": ["designation"]}},
+    },
+    "required": ["produits"],
+}
+PROMPT_BC = (
+    "Tu lis un bon de commande client (Maroc, montants en dirhams). Extrais : "
+    "la référence / numéro du bon de commande ; le nom du client qui commande (l'entreprise "
+    "émettrice du bon) ; le chantier ou lieu de livraison s'il est indiqué ; le montant total "
+    "HT du bon (si seul le TTC est indiqué, divise-le par 1,20 et mentionne-le dans la note) ; "
+    "la liste des produits / désignations avec, pour chacun, son montant HT de ligne "
+    "(quantité × prix unitaire HT) quand il est lisible, sinon null. "
+    "N'invente rien : mets null quand l'information est absente ou illisible. "
+    "Les nombres sont de simples nombres, sans espace ni symbole monétaire."
+)
+
+
+def gemini_cle():
+    """Clé API Gemini lue dans les Secrets (jamais écrite dans le code)."""
+    try:
+        v = st.secrets.get("GEMINI_API_KEY")
+        if not v and "gemini" in st.secrets:
+            v = st.secrets["gemini"].get("api_key") or st.secrets["gemini"].get("GEMINI_API_KEY")
+    except Exception:
+        v = None
+    return str(v or os.environ.get("GEMINI_API_KEY", "")).strip()
+
+
+def scanner_bc(contenu, mime):
+    """Envoie la photo / le PDF à Gemini et retourne les champs extraits (dict)."""
+    cle_api = gemini_cle()
+    if not cle_api:
+        raise RuntimeError("GEMINI_API_KEY est absente des Secrets de l'application.")
+    if len(contenu) > 15 * 1024 * 1024:
+        raise RuntimeError("Fichier trop volumineux (15 Mo maximum).")
+    try:
+        modele = st.secrets.get("GEMINI_MODEL") or GEMINI_MODELE
+    except Exception:
+        modele = GEMINI_MODELE
+    corps = {"contents": [{"parts": [
+                 {"inline_data": {"mime_type": mime, "data": base64.b64encode(contenu).decode()}},
+                 {"text": PROMPT_BC}]}],
+             "generationConfig": {"temperature": 0, "responseMimeType": "application/json",
+                                  "responseSchema": SCHEMA_BC}}
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{modele}:generateContent"
+    r = None
+    for essai in range(2):
+        r = requests.post(url, json=corps, timeout=120,
+                          headers={"x-goog-api-key": cle_api, "Content-Type": "application/json"})
+        if r.status_code in (429, 500, 503) and essai == 0:
+            time.sleep(3)
+            continue
+        break
+    if not r.ok:
+        raise RuntimeError(f"Gemini {r.status_code} : {r.text[:300]}")
+    try:
+        texte = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(texte)
+    except Exception:
+        raise RuntimeError("Réponse Gemini illisible : réessayez avec une image plus nette.")
+
+
+def _proche(nom, options):
+    """Valeur de `options` la plus proche de `nom` (ou None)."""
+    nom = (nom or "").strip().lower()
+    if not nom or not options:
+        return None
+    bas = {o.lower(): o for o in options}
+    if nom in bas:
+        return bas[nom]
+    for b, o in bas.items():
+        if len(nom) >= 4 and (nom in b or b in nom):
+            return o
+    m = difflib.get_close_matches(nom, list(bas), n=1, cutoff=0.5)
+    return bas[m[0]] if m else None
+
+
+def prepare_prefill(data, donnees):
+    """Rapproche le résultat du scan des clients / produits / chantiers connus."""
+    clients_connus = sorted(donnees["Client"].unique(), key=str)
+    client = _proche(data.get("client"), clients_connus)
+    produits, inconnus, chantier = {}, [], None
+    if client:
+        sous = donnees[donnees["Client"] == client]
+        prods_connus = sorted(sous["Produit"].unique(), key=str)
+        for p in data.get("produits") or []:
+            nom = _proche(p.get("designation"), prods_connus)
+            if nom:
+                produits[nom] = produits.get(nom, 0.0) + float(p.get("montant_ht") or 0)
+            elif p.get("designation"):
+                inconnus.append(p["designation"])
+        ch = _proche(data.get("chantier"), [c for c in sous["Chantier"].unique()
+                                            if c != "(non renseigné)"])
+        chantier = ch
+    else:
+        inconnus = [p["designation"] for p in data.get("produits") or [] if p.get("designation")]
+    return {"ref": (data.get("reference") or "").strip(), "client_lu": data.get("client") or "",
+            "client": client, "chantier": chantier, "chantier_lu": data.get("chantier") or "",
+            "montant": float(data.get("montant_total_ht") or 0), "note": (data.get("note") or "").strip(),
+            "produits": produits, "inconnus": inconnus}
+
+
+def cb_applique_scan():
+    ss = st.session_state
+    sc = ss.get("bc_scan") or {}
+    if sc.get("ref"):
+        ss["bc_ref"] = sc["ref"]
+    if sc.get("montant"):
+        ss["bc_montant"] = float(sc["montant"])
+    if sc.get("note"):
+        ss["bc_note"] = sc["note"]
+    c = sc.get("client")
+    if c:
+        ss["bc_client"] = c
+        ss[f"bc_produits_{c}"] = list(sc.get("produits", {}))
+        for p, m in sc.get("produits", {}).items():
+            ss[f"bc_pm_{c}_{p}"] = float(m or 0)
+        if sc.get("chantier"):
+            ss[f"bc_chantier_{c}"] = sc["chantier"]
+    msg("success", "Formulaire pré-rempli : vérifiez les valeurs puis enregistrez le bon.")
+    ss.pop("bc_scan", None)
 
 
 def _bc_valide(ref, client, montant, periode, d1, d2, autres, ignorer_id=None, produits=None):
@@ -1568,6 +1704,43 @@ if actif == "📑 Bons de commande":
     if est_admin:
         with st.expander("➕ Ajouter un bon de commande", expanded=sit.empty):
             clients_liste = sorted(df["Client"].unique(), key=str)
+            with st.container(border=True):
+                st.markdown("**📷 Scanner un bon de commande (IA Gemini)**")
+                if not gemini_cle():
+                    st.caption("Ajoutez `GEMINI_API_KEY` dans les Secrets de l'application pour "
+                               "activer le scan.")
+                else:
+                    scan_f = st.file_uploader("Photo ou PDF du bon de commande",
+                                              type=["png", "jpg", "jpeg", "webp", "pdf"],
+                                              key=f"bc_scan_file_{cle}")
+                    if scan_f is not None and st.button("🔍 Scanner ce bon", key="bc_scan_btn"):
+                        ext = os.path.splitext(scan_f.name)[1].lower()
+                        mime = ("application/pdf" if ext == ".pdf" else
+                                scan_f.type or ("image/png" if ext == ".png" else "image/jpeg"))
+                        with st.spinner("Lecture du bon de commande par Gemini…"):
+                            try:
+                                brut = scanner_bc(scan_f.getvalue(), mime)
+                                st.session_state["bc_scan"] = prepare_prefill(brut, df)
+                            except Exception as e:
+                                st.session_state.pop("bc_scan", None)
+                                st.error(f"Scan impossible : {e}")
+                    sc = st.session_state.get("bc_scan")
+                    if sc:
+                        st.success(f"Lu : référence **{sc['ref'] or '—'}** · client "
+                                   f"**{sc['client_lu'] or '—'}** · montant HT "
+                                   f"**{fmt(sc['montant'])} Dh**")
+                        if sc["client"] is None:
+                            st.warning("Client non reconnu parmi vos clients : choisissez-le à la main.")
+                        elif sc["client"] != sc["client_lu"]:
+                            st.caption(f"Client rapproché de : {sc['client']}")
+                        if sc["produits"]:
+                            st.write("Produits reconnus : " + " · ".join(
+                                f"{p} ({fmt(m)} Dh)" if m else p for p, m in sc["produits"].items()))
+                        if sc["inconnus"]:
+                            st.warning("Produits non reconnus (à ajouter à la main si besoin) : "
+                                       + ", ".join(sc["inconnus"]))
+                        st.button("✅ Pré-remplir le formulaire", type="primary",
+                                  on_click=cb_applique_scan, key="bc_scan_apply")
             a1, a2 = st.columns(2)
             a1.text_input("Référence du bon de commande client", key="bc_ref",
                           placeholder="ex. BC-2026-0145")
