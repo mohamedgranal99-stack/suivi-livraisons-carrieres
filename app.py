@@ -686,7 +686,7 @@ def _lit_produits(prefixe_liste, prefixe_montant):
 
 
 # ---------- Scan d'un bon de commande avec Gemini ----------
-GEMINI_MODELE = "gemini-2.5-flash"
+GEMINI_MODELES = ["gemini-3.8-flash", "gemini-flash-latest"]  # essayés dans l'ordre
 SCHEMA_BC = {
     "type": "OBJECT",
     "properties": {
@@ -749,24 +749,28 @@ def scanner_bc(contenu, mime):
         raise RuntimeError("GEMINI_API_KEY est absente des Secrets de l'application.")
     if len(contenu) > 15 * 1024 * 1024:
         raise RuntimeError("Fichier trop volumineux (15 Mo maximum).")
-    try:
-        modele = st.secrets.get("GEMINI_MODEL") or GEMINI_MODELE
-    except Exception:
-        modele = GEMINI_MODELE
     corps = {"contents": [{"parts": [
                  {"inline_data": {"mime_type": mime, "data": base64.b64encode(contenu).decode()}},
                  {"text": PROMPT_BC}]}],
              "generationConfig": {"temperature": 0, "responseMimeType": "application/json",
                                   "responseSchema": SCHEMA_BC}}
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{modele}:generateContent"
+    try:
+        impose = st.secrets.get("GEMINI_MODEL")
+    except Exception:
+        impose = None
+    modeles = [impose] if impose else GEMINI_MODELES
     r = None
-    for essai in range(2):
-        r = requests.post(url, json=corps, timeout=120,
-                          headers={"x-goog-api-key": cle_api, "Content-Type": "application/json"})
-        if r.status_code in (429, 500, 503) and essai == 0:
-            time.sleep(3)
-            continue
-        break
+    for modele in modeles:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{modele}:generateContent"
+        for essai in range(2):
+            r = requests.post(url, json=corps, timeout=120,
+                              headers={"x-goog-api-key": cle_api, "Content-Type": "application/json"})
+            if r.status_code in (429, 500, 503) and essai == 0:
+                time.sleep(3)
+                continue
+            break
+        if r.status_code != 404:  # 404 = modèle indisponible : on essaie le suivant
+            break
     if not r.ok:
         raise RuntimeError(f"Gemini {r.status_code} : {r.text[:300]}")
     try:
