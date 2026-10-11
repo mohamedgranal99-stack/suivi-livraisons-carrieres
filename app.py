@@ -690,11 +690,31 @@ def charge_bc():
 
 
 def sauve_bc(liste):
+    """Enregistre les bons puis relit Supabase (sans cache) pour vérifier qu'ils y sont."""
     kv_set("bons_commande", liste)
+    rows = sb_lire("kv", {"select": "valeur", "cle": "eq.bons_commande"})
+    relu = rows[0]["valeur"] if rows else None
+    if not isinstance(relu, list) or len(relu) != len(liste):
+        raise RuntimeError("Supabase n'a pas conservé les bons de commande (table « kv » : "
+                           "vérifiez la clé secrète, les droits et la clé unique sur « cle »).")
+
+
+def bc_msg(typ, texte):
+    """Message visible dans l'onglet Bons de commande (bandeau) et en notification flottante."""
+    st.session_state["bc_flash"] = (typ, texte)
+    try:
+        st.toast(texte, icon={"success": "✅", "error": "❌", "warning": "⚠️"}.get(typ, "ℹ️"),
+                 duration="long")
+    except TypeError:  # anciennes versions de Streamlit : pas de paramètre duration
+        st.toast(texte, icon={"success": "✅", "error": "❌", "warning": "⚠️"}.get(typ, "ℹ️"))
 
 
 def date_iso(v):
     return v.isoformat() if hasattr(v, "isoformat") else ""
+
+
+def fmt_dh(x):
+    return f"{x:,.2f}".replace(",", " ")
 
 
 def bc_produits(bc):
@@ -870,7 +890,7 @@ def cb_applique_scan():
             ss[f"bc_pm_{c}_{p}"] = float(m or 0)
         if sc.get("chantier"):
             ss[f"bc_chantier_{c}"] = sc["chantier"]
-    msg("success", "Formulaire pré-rempli : vérifiez les valeurs puis enregistrez le bon.")
+    bc_msg("success", "Formulaire pré-rempli : vérifiez les valeurs puis enregistrez le bon.")
     ss.pop("bc_scan", None)
 
 
@@ -904,7 +924,7 @@ def cb_bc_ajoute():
     d1, d2 = (ss.get("bc_d1"), ss.get("bc_d2")) if periode else (None, None)
     erreur = _bc_valide(ref, client, montant, periode, d1, d2, bcs, produits=produits)
     if erreur:
-        msg("error", erreur)
+        bc_msg("error", erreur)
         return
     bcs.append({"id": pysecrets.token_hex(4), "ref": ref, "client": client,
                 "chantier": "" if chantier in (None, TOUS) else chantier,
@@ -912,8 +932,12 @@ def cb_bc_ajoute():
                 "montant": montant, "date_debut": date_iso(d1), "date_fin": date_iso(d2),
                 "clos": False, "note": (ss.get("bc_note") or "").strip(),
                 "cree_par": moi() or "", "cree_le": datetime.now().isoformat(timespec="seconds")})
-    sauve_bc(bcs)
-    msg("success", f"Bon de commande « {ref} » enregistré.")
+    try:
+        sauve_bc(bcs)
+    except Exception as e:
+        bc_msg("error", f"Le bon « {ref} » n'a PAS été enregistré : {e}")
+        return
+    bc_msg("success", f"Bon de commande « {ref} » enregistré ({fmt_dh(montant)} Dh HT).")
     ss["bc_ref"], ss["bc_montant"], ss["bc_note"] = "", 0.0, ""
     ss[f"bc_produits_{client}"] = []
 
@@ -923,7 +947,7 @@ def cb_bc_modifie(bid):
     bcs = charge_bc()
     bc = next((b for b in bcs if b["id"] == bid), None)
     if bc is None:
-        msg("error", "Bon de commande introuvable.")
+        bc_msg("error", "Bon de commande introuvable.")
         return
     ref = (ss.get(f"bce_ref_{bid}") or "").strip()
     montant = float(ss.get(f"bce_montant_{bid}") or 0)
@@ -934,7 +958,7 @@ def cb_bc_modifie(bid):
     erreur = _bc_valide(ref, bc["client"], montant, periode, d1, d2, bcs, ignorer_id=bid,
                         produits=produits)
     if erreur:
-        msg("error", erreur)
+        bc_msg("error", erreur)
         return
     if f"bce_chantier_{bid}" in ss:
         ch = ss[f"bce_chantier_{bid}"]
@@ -943,15 +967,23 @@ def cb_bc_modifie(bid):
     bc.pop("produit", None)  # ancien format (un seul produit) remplacé par la liste
     bc.update({"ref": ref, "montant": montant, "date_debut": date_iso(d1), "date_fin": date_iso(d2),
                "clos": bool(ss.get(f"bce_clos_{bid}")), "note": (ss.get(f"bce_note_{bid}") or "").strip()})
-    sauve_bc(bcs)
-    msg("success", f"Bon de commande « {ref} » mis à jour.")
+    try:
+        sauve_bc(bcs)
+    except Exception as e:
+        bc_msg("error", f"Modification non enregistrée : {e}")
+        return
+    bc_msg("success", f"Bon de commande « {ref} » mis à jour.")
 
 
 def cb_bc_supprime(bid):
     bcs = charge_bc()
     reste = [b for b in bcs if b["id"] != bid]
-    sauve_bc(reste)
-    msg("success", "Bon de commande supprimé." if len(reste) < len(bcs) else "Bon introuvable.")
+    try:
+        sauve_bc(reste)
+    except Exception as e:
+        bc_msg("error", f"Suppression non enregistrée : {e}")
+        return
+    bc_msg("success", "Bon de commande supprimé." if len(reste) < len(bcs) else "Bon introuvable.")
 
 
 def colorie(d):
@@ -1732,6 +1764,10 @@ if actif == "📑 Bons de commande":
                "client) est comparé au montant HT du bon selon les filtres sélectionnés. "
                "Un bon peut être limité à un chantier et/ou à un ou plusieurs produits "
                "(chacun avec son propre montant, optionnel).")
+    _flash = st.session_state.pop("bc_flash", None)
+    if _flash:
+        getattr(st, _flash[0])(_flash[1])
+    st.caption(f"📑 {len(bcs)} bon(s) de commande enregistré(s) dans la base.")
     st.number_input("Seuil d'alerte (% du bon déjà consommé)", min_value=10, max_value=100,
                     value=80, step=5, key="bc_seuil")
     if sit.empty:
