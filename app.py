@@ -663,7 +663,28 @@ def date_iso(v):
     return v.isoformat() if hasattr(v, "isoformat") else ""
 
 
-def _bc_valide(ref, client, montant, periode, d1, d2, autres, ignorer_id=None):
+def bc_produits(bc):
+    """Liste des produits d'un bon : [{"produit": nom, "montant": float ou None}].
+    Compatible avec les anciens bons (un seul produit, sans montant propre)."""
+    if bc.get("produits"):
+        return [{"produit": p["produit"], "montant": p.get("montant") or None}
+                for p in bc["produits"]]
+    if bc.get("produit"):
+        return [{"produit": bc["produit"], "montant": None}]
+    return []
+
+
+def _lit_produits(prefixe_liste, prefixe_montant):
+    """Lit dans la session les produits choisis et leur montant optionnel (0 = non précisé)."""
+    ss = st.session_state
+    out = []
+    for p in ss.get(prefixe_liste) or []:
+        m = float(ss.get(f"{prefixe_montant}{p}") or 0)
+        out.append({"produit": p, "montant": m if m > 0 else None})
+    return out
+
+
+def _bc_valide(ref, client, montant, periode, d1, d2, autres, ignorer_id=None, produits=None):
     if not ref:
         return "Saisissez la référence du bon de commande."
     if not client:
@@ -674,6 +695,10 @@ def _bc_valide(ref, client, montant, periode, d1, d2, autres, ignorer_id=None):
         return f"La référence « {ref} » existe déjà."
     if periode and d1 and d2 and d1 > d2:
         return "La date de début doit précéder la date de fin."
+    somme = sum(p["montant"] or 0 for p in (produits or []))
+    if somme > montant + 0.005:
+        return (f"La somme des montants par produit ({somme:,.2f}) dépasse le montant HT du "
+                f"bon de commande ({montant:,.2f}).")
     return None
 
 
@@ -683,23 +708,24 @@ def cb_bc_ajoute():
     ref = (ss.get("bc_ref") or "").strip()
     client = ss.get("bc_client")
     chantier = ss.get(f"bc_chantier_{client}")
-    produit = ss.get(f"bc_produit_{client}")
+    produits = _lit_produits(f"bc_produits_{client}", f"bc_pm_{client}_")
     montant = float(ss.get("bc_montant") or 0)
     periode = bool(ss.get("bc_periode"))
     d1, d2 = (ss.get("bc_d1"), ss.get("bc_d2")) if periode else (None, None)
-    erreur = _bc_valide(ref, client, montant, periode, d1, d2, bcs)
+    erreur = _bc_valide(ref, client, montant, periode, d1, d2, bcs, produits=produits)
     if erreur:
         msg("error", erreur)
         return
     bcs.append({"id": pysecrets.token_hex(4), "ref": ref, "client": client,
                 "chantier": "" if chantier in (None, TOUS) else chantier,
-                "produit": "" if produit in (None, TOUS_PRODUITS) else produit,
+                "produits": produits,
                 "montant": montant, "date_debut": date_iso(d1), "date_fin": date_iso(d2),
                 "clos": False, "note": (ss.get("bc_note") or "").strip(),
                 "cree_par": moi() or "", "cree_le": datetime.now().isoformat(timespec="seconds")})
     sauve_bc(bcs)
     msg("success", f"Bon de commande « {ref} » enregistré.")
     ss["bc_ref"], ss["bc_montant"], ss["bc_note"] = "", 0.0, ""
+    ss[f"bc_produits_{client}"] = []
 
 
 def cb_bc_modifie(bid):
@@ -713,16 +739,18 @@ def cb_bc_modifie(bid):
     montant = float(ss.get(f"bce_montant_{bid}") or 0)
     periode = bool(ss.get(f"bce_periode_{bid}"))
     d1, d2 = ((ss.get(f"bce_d1_{bid}"), ss.get(f"bce_d2_{bid}")) if periode else (None, None))
-    erreur = _bc_valide(ref, bc["client"], montant, periode, d1, d2, bcs, ignorer_id=bid)
+    produits = (_lit_produits(f"bce_produits_{bid}", f"bce_pm_{bid}_")
+                if f"bce_produits_{bid}" in ss else bc_produits(bc))
+    erreur = _bc_valide(ref, bc["client"], montant, periode, d1, d2, bcs, ignorer_id=bid,
+                        produits=produits)
     if erreur:
         msg("error", erreur)
         return
     if f"bce_chantier_{bid}" in ss:
         ch = ss[f"bce_chantier_{bid}"]
         bc["chantier"] = "" if ch in (None, TOUS) else ch
-    if f"bce_produit_{bid}" in ss:
-        pr = ss[f"bce_produit_{bid}"]
-        bc["produit"] = "" if pr in (None, TOUS_PRODUITS) else pr
+    bc["produits"] = produits
+    bc.pop("produit", None)  # ancien format (un seul produit) remplacé par la liste
     bc.update({"ref": ref, "montant": montant, "date_debut": date_iso(d1), "date_fin": date_iso(d2),
                "clos": bool(ss.get(f"bce_clos_{bid}")), "note": (ss.get(f"bce_note_{bid}") or "").strip()})
     sauve_bc(bcs)
@@ -757,19 +785,21 @@ def _fr(iso):
 
 def calcule_situation(base, bcs, seuil):
     colonnes = ["id", "Référence BC", "Client", "Chantier", "Produit", "Période", "Montant BC (HT)",
-                "Livré (HT)", "Reste", "Dépassement", "% consommé", "Statut", "Qté livrée"]
+                "Livré (HT)", "Reste", "Dépassement", "% consommé", "Statut", "Qté livrée",
+                "Détail produits"]
     qcol = next(iter(QTES), None)
     lignes = []
     for bc in bcs:
         sub = base[base["Client"] == bc["client"]]
         if bc.get("chantier") and "Chantier" in sub.columns:
             sub = sub[sub["Chantier"] == bc["chantier"]]
-        if bc.get("produit"):
-            sub = sub[sub["Produit"] == bc["produit"]]
         if bc.get("date_debut"):
             sub = sub[sub["Jour"] >= bc["date_debut"]]
         if bc.get("date_fin"):
             sub = sub[sub["Jour"] <= bc["date_fin"]]
+        prods = bc_produits(bc)
+        if prods:
+            sub = sub[sub["Produit"].isin([p["produit"] for p in prods])]
         livre = float(sub["Montant HT Net"].sum())
         montant = float(bc["montant"])
         pct = livre / montant * 100 if montant > 0 else 0.0
@@ -781,16 +811,32 @@ def calcule_situation(base, bcs, seuil):
             statut = STATUT_PROCHE
         else:
             statut = STATUT_OK
+        # Détail par produit (montant propre optionnel) : peut aggraver le statut du bon
+        details = []
+        for p in prods:
+            lp = float(sub.loc[sub["Produit"] == p["produit"], "Montant HT Net"].sum())
+            if p["montant"]:
+                pp = lp / p["montant"] * 100
+                details.append(f"{p['produit']} : {lp:,.0f} / {p['montant']:,.0f} ({pp:.0f} %)")
+                if not bc.get("clos"):
+                    if round(lp, 2) >= round(p["montant"], 2):
+                        statut = STATUT_DEPASSE
+                    elif pp >= seuil and statut == STATUT_OK:
+                        statut = STATUT_PROCHE
+            else:
+                details.append(f"{p['produit']} : {lp:,.0f}")
         d1, d2 = bc.get("date_debut"), bc.get("date_fin")
         periode = ("toute la période" if not (d1 or d2) else
                    f"{_fr(d1) if d1 else '…'} → {_fr(d2) if d2 else '…'}")
         lignes.append({"id": bc["id"], "Référence BC": bc["ref"], "Client": bc["client"],
                        "Chantier": bc.get("chantier") or "(tous)",
-                       "Produit": bc.get("produit") or "(tous)", "Période": periode,
+                       "Produit": ", ".join(p["produit"] for p in prods) or "(tous)",
+                       "Période": periode,
                        "Montant BC (HT)": montant, "Livré (HT)": livre,
                        "Reste": max(montant - livre, 0.0), "Dépassement": max(livre - montant, 0.0),
                        "% consommé": round(pct, 1), "Statut": statut,
-                       "Qté livrée": float(sub[qcol].sum()) if qcol else None})
+                       "Qté livrée": float(sub[qcol].sum()) if qcol else None,
+                       "Détail produits": " | ".join(details)})
     return pd.DataFrame(lignes, columns=colonnes)
 
 
@@ -1494,7 +1540,8 @@ if c_chantier:
 if actif == "📑 Bons de commande":
     st.caption("Pour chaque bon de commande, le montant livré (Montant HT des livraisons du "
                "client) est comparé au montant HT du bon selon les filtres sélectionnés. "
-               "Un bon peut être limité à un chantier et/ou à un produit.")
+               "Un bon peut être limité à un chantier et/ou à un ou plusieurs produits "
+               "(chacun avec son propre montant, optionnel).")
     st.number_input("Seuil d'alerte (% du bon déjà consommé)", min_value=10, max_value=100,
                     value=80, step=5, key="bc_seuil")
     if sit.empty:
@@ -1508,6 +1555,8 @@ if actif == "📑 Bons de commande":
         aff = sit.drop(columns=["id"]).sort_values("% consommé", ascending=False)
         if not c_qte:
             aff = aff.drop(columns=["Qté livrée"])
+        if not aff["Détail produits"].astype(bool).any():
+            aff = aff.drop(columns=["Détail produits"])
         st.dataframe(aff, use_container_width=True, hide_index=True, column_config={
             "Montant BC (HT)": st.column_config.NumberColumn(format="%.2f"),
             "Livré (HT)": st.column_config.NumberColumn(format="%.2f"),
@@ -1530,9 +1579,14 @@ if actif == "📑 Bons de commande":
                 chs = sorted(df.loc[df["Client"] == client_bc, "Chantier"].unique(), key=str)
                 a4.selectbox("Chantier (optionnel)", [TOUS] + chs, key=f"bc_chantier_{client_bc}")
             prods = sorted(df.loc[df["Client"] == client_bc, "Produit"].unique(), key=str)
-            b1, _b2 = st.columns(2)
-            b1.selectbox("Produit (optionnel)", [TOUS_PRODUITS] + prods,
-                         key=f"bc_produit_{client_bc}")
+            choisis = st.multiselect("Produits (optionnel : vide = tous les produits)", prods,
+                                     key=f"bc_produits_{client_bc}")
+            if choisis:
+                st.caption("Montant HT propre à chaque produit (optionnel : 0 = pas de montant "
+                           "précis pour ce produit, il compte seulement dans le total du bon).")
+                for p in choisis:
+                    st.number_input(f"Montant HT — {p} (Dh)", min_value=0.0, step=1000.0,
+                                    format="%.2f", key=f"bc_pm_{client_bc}_{p}")
             st.checkbox("Limiter à une période (optionnel)", key="bc_periode")
             if st.session_state.get("bc_periode"):
                 p1, p2 = st.columns(2)
@@ -1553,18 +1607,25 @@ if actif == "📑 Bons de commande":
                 st.checkbox("Clôturé (plus d'alerte pour ce bon)", value=bool(bc.get("clos")),
                             key=f"bce_clos_{bid}")
                 cl_bc = bc["client"]
-                e1, e2 = st.columns(2)
                 if c_chantier:
                     chs = sorted(set(df.loc[df["Client"] == cl_bc, "Chantier"].unique())
                                  | ({bc["chantier"]} if bc.get("chantier") else set()), key=str)
                     opts_c = [TOUS] + chs
-                    e1.selectbox("Chantier", opts_c, key=f"bce_chantier_{bid}",
+                    st.selectbox("Chantier", opts_c, key=f"bce_chantier_{bid}",
                                  index=opts_c.index(bc["chantier"]) if bc.get("chantier") in opts_c else 0)
+                actuels = bc_produits(bc)
                 prods = sorted(set(df.loc[df["Client"] == cl_bc, "Produit"].unique())
-                               | ({bc["produit"]} if bc.get("produit") else set()), key=str)
-                opts_p = [TOUS_PRODUITS] + prods
-                e2.selectbox("Produit", opts_p, key=f"bce_produit_{bid}",
-                             index=opts_p.index(bc["produit"]) if bc.get("produit") in opts_p else 0)
+                               | {p["produit"] for p in actuels}, key=str)
+                choisis_e = st.multiselect("Produits (vide = tous les produits)", prods,
+                                           default=[p["produit"] for p in actuels],
+                                           key=f"bce_produits_{bid}")
+                montants_actuels = {p["produit"]: p["montant"] for p in actuels}
+                if choisis_e:
+                    st.caption("Montant HT propre à chaque produit (optionnel : 0 = non précisé).")
+                    for p in choisis_e:
+                        st.number_input(f"Montant HT — {p} (Dh)", min_value=0.0, step=1000.0,
+                                        format="%.2f", value=float(montants_actuels.get(p) or 0.0),
+                                        key=f"bce_pm_{bid}_{p}")
                 a_periode = st.checkbox("Limiter à une période",
                                         value=bool(bc.get("date_debut") or bc.get("date_fin")),
                                         key=f"bce_periode_{bid}")
