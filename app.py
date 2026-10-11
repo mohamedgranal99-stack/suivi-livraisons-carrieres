@@ -739,7 +739,7 @@ def _lit_produits(prefixe_liste, prefixe_montant):
 
 
 # ---------- Scan d'un bon de commande avec Gemini ----------
-GEMINI_MODELES = ["gemini-3.8-flash", "gemini-flash-latest"]  # essayés dans l'ordre
+GEMINI_MODELES = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-flash-lite-latest"]  # essayés dans l'ordre
 SCHEMA_BC = {
     "type": "OBJECT",
     "properties": {
@@ -815,16 +815,21 @@ def scanner_bc(contenu, mime):
     r = None
     for modele in modeles:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{modele}:generateContent"
-        for essai in range(2):
-            r = requests.post(url, json=corps, timeout=120,
-                              headers={"x-goog-api-key": cle_api, "Content-Type": "application/json"})
-            if r.status_code in (429, 500, 503) and essai == 0:
-                time.sleep(3)
-                continue
-            break
-        if r.status_code != 404:  # 404 = modèle indisponible : on essaie le suivant
+        for pause in (0, 2, 5):  # jusqu'à 3 essais si Google est surchargé (429 / 500 / 503)
+            time.sleep(pause)
+            try:
+                r = requests.post(url, json=corps, timeout=120,
+                                  headers={"x-goog-api-key": cle_api, "Content-Type": "application/json"})
+            except requests.RequestException as e:
+                raise RuntimeError(f"Connexion à Gemini impossible : {e}")
+            if r.status_code not in (429, 500, 503):
+                break
+        if r.status_code not in (404, 429, 500, 503):  # sinon : on essaie le modèle suivant
             break
     if not r.ok:
+        if r.status_code in (429, 500, 503):
+            raise RuntimeError("Gemini est surchargé en ce moment (erreur %d). Réessayez dans "
+                               "une minute." % r.status_code)
         raise RuntimeError(f"Gemini {r.status_code} : {r.text[:300]}")
     try:
         texte = r.json()["candidates"][0]["content"]["parts"][0]["text"]
